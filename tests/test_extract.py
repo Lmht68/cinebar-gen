@@ -13,6 +13,7 @@ from numpy.typing import NDArray
 
 import cinebar.extract as extract_module
 from cinebar import CinebarError, FailureCategory
+from cinebar.crop import CropRectangle
 from cinebar.extract import (
     ExtractedFrameRange,
     FrameRange,
@@ -156,8 +157,11 @@ class FakePool:
 
     def starmap(
         self,
-        function: Callable[[str, FrameRange, int], ExtractedFrameRange],
-        tasks: list[tuple[str, FrameRange, int]],
+        function: Callable[
+            [str, FrameRange, int, CropRectangle | None],
+            ExtractedFrameRange,
+        ],
+        tasks: list[tuple[str, FrameRange, int, CropRectangle | None]],
     ) -> list[ExtractedFrameRange]:
         """Execute submitted extraction tasks in order."""
         return [function(*task) for task in tasks]
@@ -184,6 +188,40 @@ def test_extract_frame_colors_validates_and_combines_worker_ranges(
     colors = extract_frame_colors(Path("movie.mp4"), workers=2)
 
     assert colors == bytes((0, 1, 2, 1, 2, 3, 2, 3, 4, 3, 4, 5))
+    assert len(captures) == 3
+    assert all(capture.released for capture in captures)
+
+
+def test_extract_frame_colors_applies_crop_to_every_worker_range(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reduce each assigned frame's fixed picture region in compact RGB order."""
+    rectangle = CropRectangle(left=1, top=1, right=3, bottom=3)
+    frames = []
+    for picture_bgr in [
+        (36, 24, 12),
+        (60, 40, 20),
+        (84, 56, 28),
+        (108, 72, 36),
+    ]:
+        frame = np.zeros((4, 4, 3), dtype=np.uint8)
+        frame[1:3, 1:3] = picture_bgr
+        frame[1, 1] = (0, 0, 0)
+        frames.append(frame)
+
+    captures: list[FakeVideoCapture] = []
+
+    def create_capture(_: str) -> FakeVideoCapture:
+        capture = FakeVideoCapture(frames)
+        captures.append(capture)
+        return capture
+
+    monkeypatch.setattr(cv2, "VideoCapture", create_capture)
+    monkeypatch.setattr(extract_module, "Pool", FakePool)
+
+    colors = extract_frame_colors(Path("movie.mp4"), workers=2, crop=rectangle)
+
+    assert colors == bytes((9, 18, 27, 15, 30, 45, 21, 42, 63, 27, 54, 81))
     assert len(captures) == 3
     assert all(capture.released for capture in captures)
 

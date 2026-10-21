@@ -1,15 +1,15 @@
-"""Behavior tests for no-crop barcode processing."""
+"""Behavior tests for complete barcode processing."""
 
 import pickle
 from pathlib import Path
-from typing import BinaryIO
+from typing import BinaryIO, cast
 
 import cv2
 import numpy as np
 import png
 import pytest
 
-from cinebar import CinebarError, FailureCategory
+from cinebar import CinebarError, CropRectangle, FailureCategory
 from cinebar.processor import SingleFileProcessor
 
 
@@ -21,6 +21,21 @@ from cinebar.processor import SingleFileProcessor
             "Invalid command-line arguments. Run 'cinebar --help' for usage.",
         ),
         (FailureCategory.INVALID_HEIGHT, "Height must be a positive integer."),
+        (
+            FailureCategory.INVALID_CROP,
+            (
+                "Explicit crop must use four non-negative integers as "
+                "LEFT,TOP,RIGHT,BOTTOM, define a non-empty rectangle, and fit every "
+                "decoded frame."
+            ),
+        ),
+        (
+            FailureCategory.NON_BLACK_CROP_BOUNDARY,
+            (
+                "Every applicable explicit crop boundary must be exact black in every "
+                "frame. Adjust --crop or use --crop none."
+            ),
+        ),
         (
             FailureCategory.INPUT_NOT_FOUND,
             "Input media was not found. Verify the source path and try again.",
@@ -173,6 +188,178 @@ def test_process_rejects_malformed_decoded_frame(
     assert not list(tmp_path.glob(f".{output_path.name}.*.tmp"))
 
 
+def test_process_applies_letterbox_crop_with_black_picture_content(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Publish the exact mean of a valid letterboxed picture region."""
+    media_path = tmp_path / "letterbox.mkv"
+    output_path = tmp_path / "letterbox.png"
+    media_path.write_bytes(b"placeholder")
+    bgr_frame = np.zeros((4, 4, 3), dtype=np.uint8)
+    bgr_frame[1:3] = (40, 80, 120)
+    bgr_frame[1, 1] = (0, 0, 0)
+    capture = _SequentialCapture([(True, bgr_frame)])
+    monkeypatch.setattr(cv2, "VideoCapture", lambda _: capture)
+
+    result = SingleFileProcessor().process(
+        media_path,
+        output_path,
+        height=2,
+        workers=1,
+        crop=CropRectangle(left=0, top=1, right=4, bottom=3),
+    )
+
+    with output_path.open("rb") as barcode_file:
+        width, height, rows, _ = png.Reader(file=barcode_file).read()
+        actual_rows = [list(row) for row in rows]
+
+    assert result.decoded_frame_count == 1
+    assert width == 1
+    assert height == 2
+    assert actual_rows == [[105, 70, 35], [105, 70, 35]]
+
+
+def test_process_applies_pillarbox_crop_with_black_picture_content(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Publish the exact mean of a valid pillarboxed picture region."""
+    media_path = tmp_path / "pillarbox.mkv"
+    output_path = tmp_path / "pillarbox.png"
+    media_path.write_bytes(b"placeholder")
+    bgr_frame = np.zeros((4, 4, 3), dtype=np.uint8)
+    bgr_frame[:, 1:3] = (80, 40, 20)
+    bgr_frame[0, 1] = (0, 0, 0)
+    capture = _SequentialCapture([(True, bgr_frame)])
+    monkeypatch.setattr(cv2, "VideoCapture", lambda _: capture)
+
+    result = SingleFileProcessor().process(
+        media_path,
+        output_path,
+        height=2,
+        workers=1,
+        crop=CropRectangle(left=1, top=0, right=3, bottom=4),
+    )
+
+    with output_path.open("rb") as barcode_file:
+        width, height, rows, _ = png.Reader(file=barcode_file).read()
+        actual_rows = [list(row) for row in rows]
+
+    assert result.decoded_frame_count == 1
+    assert width == 1
+    assert height == 2
+    assert actual_rows == [[17, 35, 70], [17, 35, 70]]
+
+
+def test_process_accepts_crop_when_later_frame_gains_a_black_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Keep one rectangle when a later wider frame begins excluding its right side."""
+    media_path = tmp_path / "changing-dimensions.mkv"
+    output_path = tmp_path / "changing-dimensions.png"
+    media_path.write_bytes(b"placeholder")
+    first_frame = np.zeros((2, 3, 3), dtype=np.uint8)
+    first_frame[:, 1:3] = (40, 20, 10)
+    later_frame = np.zeros((2, 4, 3), dtype=np.uint8)
+    later_frame[:, 1:3] = (80, 40, 20)
+    capture = _SequentialCapture([(True, first_frame), (True, later_frame)])
+    monkeypatch.setattr(cv2, "VideoCapture", lambda _: capture)
+
+    SingleFileProcessor().process(
+        media_path,
+        output_path,
+        height=1,
+        workers=1,
+        crop=CropRectangle(left=1, top=0, right=3, bottom=2),
+    )
+
+    with output_path.open("rb") as barcode_file:
+        width, height, rows, _ = png.Reader(file=barcode_file).read()
+        actual_rows = [list(row) for row in rows]
+
+    assert width == 2
+    assert height == 1
+    assert actual_rows == [[10, 20, 40, 20, 40, 80]]
+
+
+def test_process_rejects_crop_out_of_bounds_on_later_frame_before_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reject a rectangle that a later decoded frame can no longer contain."""
+    media_path = tmp_path / "smaller-frame.mkv"
+    output_path = tmp_path / "smaller-frame.png"
+    media_path.write_bytes(b"placeholder")
+    capture = _SequentialCapture(
+        [
+            (True, np.zeros((3, 3, 3), dtype=np.uint8)),
+            (True, np.zeros((2, 3, 3), dtype=np.uint8)),
+        ]
+    )
+    monkeypatch.setattr(cv2, "VideoCapture", lambda _: capture)
+
+    with pytest.raises(CinebarError) as raised_error:
+        SingleFileProcessor().process(
+            media_path,
+            output_path,
+            workers=1,
+            crop=CropRectangle(left=1, top=1, right=3, bottom=3),
+        )
+
+    assert raised_error.value.category is FailureCategory.INVALID_CROP
+    assert not output_path.exists()
+    assert not list(tmp_path.glob(f".{output_path.name}.*.tmp"))
+
+
+def test_process_rejects_non_black_crop_boundary_before_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reject one later non-black pixel on an applicable crop boundary."""
+    media_path = tmp_path / "non-black-boundary.mkv"
+    output_path = tmp_path / "non-black-boundary.png"
+    media_path.write_bytes(b"placeholder")
+    later_frame = np.zeros((4, 4, 3), dtype=np.uint8)
+    later_frame[3, 1] = (1, 0, 0)
+    capture = _SequentialCapture(
+        [(True, np.zeros((3, 3, 3), dtype=np.uint8)), (True, later_frame)]
+    )
+    monkeypatch.setattr(cv2, "VideoCapture", lambda _: capture)
+
+    with pytest.raises(CinebarError) as raised_error:
+        SingleFileProcessor().process(
+            media_path,
+            output_path,
+            workers=1,
+            crop=CropRectangle(left=1, top=1, right=3, bottom=3),
+        )
+
+    assert raised_error.value.category is FailureCategory.NON_BLACK_CROP_BOUNDARY
+    assert not output_path.exists()
+    assert not list(tmp_path.glob(f".{output_path.name}.*.tmp"))
+
+
+def test_process_rejects_runtime_crop_value_before_media_access(tmp_path: Path) -> None:
+    """Reject a non-rectangle crop before reading the source or creating output."""
+    color_extractor_called = False
+
+    def extract_colors(
+        _: Path,
+        __: int | None,
+        ___: CropRectangle | None,
+    ) -> bytes:
+        nonlocal color_extractor_called
+        color_extractor_called = True
+        return bytes((1, 2, 3))
+
+    with pytest.raises(CinebarError) as raised_error:
+        SingleFileProcessor(extract_colors).process(
+            tmp_path / "missing-source.mkv",
+            tmp_path / "barcode.png",
+            crop=cast(CropRectangle, object()),
+        )
+
+    assert raised_error.value.category is FailureCategory.INVALID_CROP
+    assert color_extractor_called is False
+
+
 @pytest.mark.parametrize("height", [0, -1])
 def test_process_rejects_non_positive_height_before_media_access(
     tmp_path: Path, height: int
@@ -180,7 +367,11 @@ def test_process_rejects_non_positive_height_before_media_access(
     """Reject invalid heights before accessing the source or calling the extractor."""
     color_extractor_called = False
 
-    def extract_colors(_: Path, __: int | None) -> bytes:
+    def extract_colors(
+        _: Path,
+        __: int | None,
+        ___: CropRectangle | None,
+    ) -> bytes:
         nonlocal color_extractor_called
         color_extractor_called = True
         return b""
@@ -203,7 +394,11 @@ def test_process_rejects_non_positive_worker_count_before_media_access(
     """Reject an explicit invalid worker count before accessing the source."""
     color_extractor_called = False
 
-    def extract_colors(_: Path, __: int | None) -> bytes:
+    def extract_colors(
+        _: Path,
+        __: int | None,
+        ___: CropRectangle | None,
+    ) -> bytes:
         nonlocal color_extractor_called
         color_extractor_called = True
         return b""
@@ -227,7 +422,11 @@ def test_process_refuses_existing_output_before_decoding(tmp_path: Path) -> None
     output_path.write_bytes(b"existing barcode")
     color_extractor_called = False
 
-    def extract_colors(_: Path, __: int | None) -> bytes:
+    def extract_colors(
+        _: Path,
+        __: int | None,
+        ___: CropRectangle | None,
+    ) -> bytes:
         nonlocal color_extractor_called
         color_extractor_called = True
         return bytes((1, 2, 3))
@@ -245,7 +444,11 @@ def test_process_rejects_missing_input_before_decoding(tmp_path: Path) -> None:
     output_path = tmp_path / "barcode.png"
     color_extractor_called = False
 
-    def extract_colors(_: Path, __: int | None) -> bytes:
+    def extract_colors(
+        _: Path,
+        __: int | None,
+        ___: CropRectangle | None,
+    ) -> bytes:
         nonlocal color_extractor_called
         color_extractor_called = True
         return bytes((1, 2, 3))
@@ -265,7 +468,11 @@ def test_process_rejects_non_regular_input_before_decoding(tmp_path: Path) -> No
     output_path = tmp_path / "barcode.png"
     color_extractor_called = False
 
-    def extract_colors(_: Path, __: int | None) -> bytes:
+    def extract_colors(
+        _: Path,
+        __: int | None,
+        ___: CropRectangle | None,
+    ) -> bytes:
         nonlocal color_extractor_called
         color_extractor_called = True
         return bytes((1, 2, 3))
@@ -300,7 +507,11 @@ def test_process_writes_ordered_colors_with_black_frame(tmp_path: Path) -> None:
         )
     )
 
-    def extract_colors(_: Path, __: int | None) -> bytes:
+    def extract_colors(
+        _: Path,
+        __: int | None,
+        ___: CropRectangle | None,
+    ) -> bytes:
         return compact_colors
 
     media_path = tmp_path / "source.mkv"
@@ -347,7 +558,7 @@ def test_process_defaults_to_300_pixel_height(tmp_path: Path) -> None:
     output_path = tmp_path / "default-height.png"
     media_path.write_bytes(b"placeholder")
 
-    result = SingleFileProcessor(lambda _path, _workers: compact_colors).process(
+    result = SingleFileProcessor(lambda _path, _workers, _crop: compact_colors).process(
         media_path, output_path
     )
 
@@ -368,7 +579,7 @@ def test_process_rejects_empty_decode_before_creating_output(tmp_path: Path) -> 
     media_path.write_bytes(b"placeholder")
 
     with pytest.raises(CinebarError) as raised_error:
-        SingleFileProcessor(lambda _path, _workers: b"").process(
+        SingleFileProcessor(lambda _path, _workers, _crop: b"").process(
             media_path, output_path
         )
 
@@ -386,7 +597,7 @@ def test_process_rejects_incomplete_frame_colors_before_creating_output(
     media_path.write_bytes(b"placeholder")
 
     with pytest.raises(CinebarError) as raised_error:
-        SingleFileProcessor(lambda _path, _workers: bytes((1, 2))).process(
+        SingleFileProcessor(lambda _path, _workers, _crop: bytes((1, 2))).process(
             media_path, output_path
         )
 
@@ -403,7 +614,7 @@ def test_process_overwrite_replaces_output_with_complete_png(tmp_path: Path) -> 
     output_path.write_bytes(b"previous barcode")
     compact_colors = bytes((10, 20, 30, 40, 50, 60))
 
-    SingleFileProcessor(lambda _path, _workers: compact_colors).process(
+    SingleFileProcessor(lambda _path, _workers, _crop: compact_colors).process(
         media_path,
         output_path,
         height=2,
@@ -442,7 +653,7 @@ def test_process_encodes_open_destination_temporary_before_replacement(
 
     monkeypatch.setattr(png.Writer, "write", observe_write)
 
-    SingleFileProcessor(lambda _path, _workers: bytes((1, 2, 3))).process(
+    SingleFileProcessor(lambda _path, _workers, _crop: bytes((1, 2, 3))).process(
         media_path,
         output_path,
         overwrite=True,
@@ -468,7 +679,7 @@ def test_process_removes_temporary_after_partial_write_failure(
     monkeypatch.setattr(png.Writer, "write", raise_partial_write)
 
     with pytest.raises(CinebarError) as raised_error:
-        SingleFileProcessor(lambda _path, _workers: bytes((1, 2, 3))).process(
+        SingleFileProcessor(lambda _path, _workers, _crop: bytes((1, 2, 3))).process(
             media_path,
             output_path,
             overwrite=True,
@@ -494,7 +705,7 @@ def test_process_removes_temporary_after_interruption(
     monkeypatch.setattr(png.Writer, "write", raise_interruption)
 
     with pytest.raises(CinebarError) as raised_error:
-        SingleFileProcessor(lambda _path, _workers: bytes((1, 2, 3))).process(
+        SingleFileProcessor(lambda _path, _workers, _crop: bytes((1, 2, 3))).process(
             media_path,
             output_path,
             overwrite=True,
@@ -523,7 +734,7 @@ def test_process_refuses_output_created_while_encoding(
     monkeypatch.setattr(png.Writer, "write", create_competing_output)
 
     with pytest.raises(CinebarError) as raised_error:
-        SingleFileProcessor(lambda _path, _workers: bytes((1, 2, 3))).process(
+        SingleFileProcessor(lambda _path, _workers, _crop: bytes((1, 2, 3))).process(
             media_path,
             output_path,
         )
@@ -539,7 +750,11 @@ def test_process_classifies_interruption_during_decoding(tmp_path: Path) -> None
     output_path = tmp_path / "barcode.png"
     media_path.write_bytes(b"placeholder")
 
-    def interrupt_decoding(_: Path, __: int | None) -> bytes:
+    def interrupt_decoding(
+        _: Path,
+        __: int | None,
+        ___: CropRectangle | None,
+    ) -> bytes:
         raise KeyboardInterrupt
 
     with pytest.raises(CinebarError) as raised_error:

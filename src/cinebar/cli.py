@@ -1,4 +1,4 @@
-"""Command-line interface for complete no-crop barcode generation."""
+"""Command-line interface for complete media barcode generation."""
 
 import argparse
 import logging
@@ -7,6 +7,7 @@ from multiprocessing import freeze_support
 from pathlib import Path
 from typing import NoReturn
 
+from .crop import CropRectangle
 from .errors import CinebarError, FailureCategory
 from .processor import SingleFileProcessor
 
@@ -26,7 +27,7 @@ class _CinebarArgumentParser(argparse.ArgumentParser):
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """Generate one no-crop barcode from a local media file.
+    """Generate one complete barcode from a local media file.
 
     Args:
         argv: Optional command-line arguments excluding the program name.
@@ -37,7 +38,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     freeze_support()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     parser = _CinebarArgumentParser(
-        description="Generate a complete lossless no-crop media barcode."
+        description="Generate a complete lossless media barcode."
     )
     parser.add_argument("media_path", type=Path, help="Local media file to decode.")
     parser.add_argument("--output", required=True, type=Path, help="Final PNG path.")
@@ -55,9 +56,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument(
         "--crop",
-        choices=("none",),
-        default="none",
-        help="Crop mode. Only 'none' is currently supported.",
+        type=_crop_selection,
+        default=None,
+        metavar="none|LEFT,TOP,RIGHT,BOTTOM",
+        help=(
+            "Picture region: none or LEFT,TOP,RIGHT,BOTTOM with inclusive left/top "
+            "and exclusive right/bottom."
+        ),
     )
     parser.add_argument(
         "--overwrite",
@@ -73,6 +78,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             height=arguments.height,
             workers=arguments.workers,
             overwrite=arguments.overwrite,
+            crop=arguments.crop,
         )
     except CinebarError as error:
         LOGGER.error("[%s] %s", error.category.value, error)
@@ -124,3 +130,30 @@ def _positive_worker_count(value: str) -> int:
     if parsed_value <= 0:
         raise CinebarError(FailureCategory.INVALID_ARGUMENT)
     return parsed_value
+
+
+def _crop_selection(value: str) -> CropRectangle | None:
+    """Parse one supported fixed explicit crop selection.
+
+    Args:
+        value: Raw ``none`` token or four comma-separated decimal coordinates.
+
+    Returns:
+        ``None`` for ``none`` or one validated explicit crop rectangle.
+
+    Raises:
+        CinebarError: If the selection is malformed or has invalid bounds.
+    """
+    if value == "none":
+        return None
+
+    coordinate_texts = value.split(",")
+    if len(coordinate_texts) != 4:
+        raise CinebarError(FailureCategory.INVALID_CROP)
+    try:
+        left, top, right, bottom = (
+            int(coordinate_text, 10) for coordinate_text in coordinate_texts
+        )
+    except ValueError:
+        raise CinebarError(FailureCategory.INVALID_CROP) from None
+    return CropRectangle(left=left, top=top, right=right, bottom=bottom)

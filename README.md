@@ -31,6 +31,19 @@ Set `--workers N` to choose the process count or `--workers 1` to decode sequent
 uv run cinebar movie.mp4 --output movie-barcode.png --workers 8 --crop none
 ```
 
+Omit `--crop` or use `--crop none` to use every pixel in each decoded frame.
+
+```console
+uv run cinebar movie.mp4 --output movie-barcode.png --workers 1 --crop 140,80,1780,1000
+```
+
+An explicit crop uses zero-based `LEFT,TOP,RIGHT,BOTTOM` coordinates, with inclusive left and top edges and exclusive right and bottom edges.
+The same non-empty rectangle must fit every decoded frame.
+For each side that removes pixels, the complete last excluded row or column must be exact decoded RGB `(0, 0, 0)` in every frame.
+Sides that remove no pixels have no crop boundary to validate.
+Genuine black pixels inside the accepted picture region remain part of the frame-color arithmetic mean.
+Invalid crop bounds or a non-black crop boundary fails without publishing a final PNG or retaining a destination-side temporary PNG.
+
 Each frame color is OpenCV's per-channel arithmetic mean, truncated to 8-bit values and stored in RGB order.
 Parallel workers process contiguous reported frame-index ranges, and the parent writes their compact colors in range order.
 Parallel extraction validates seek positions, exact range lengths, adjacent raw-frame digests, and the final end of stream before publishing.

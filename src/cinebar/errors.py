@@ -8,6 +8,8 @@ class FailureCategory(StrEnum):
 
     INVALID_ARGUMENT = "invalid_argument"
     INVALID_HEIGHT = "invalid_height"
+    INVALID_CROP = "invalid_crop"
+    NON_BLACK_CROP_BOUNDARY = "non_black_crop_boundary"
     INPUT_NOT_FOUND = "input_not_found"
     INPUT_UNREADABLE = "input_unreadable"
     NO_VIDEO_STREAM = "no_video_stream"
@@ -24,6 +26,14 @@ _FAILURE_MESSAGES: dict[FailureCategory, str] = {
         "Invalid command-line arguments. Run 'cinebar --help' for usage."
     ),
     FailureCategory.INVALID_HEIGHT: "Height must be a positive integer.",
+    FailureCategory.INVALID_CROP: (
+        "Explicit crop must use four non-negative integers as LEFT,TOP,RIGHT,BOTTOM, "
+        "define a non-empty rectangle, and fit every decoded frame."
+    ),
+    FailureCategory.NON_BLACK_CROP_BOUNDARY: (
+        "Every applicable explicit crop boundary must be exact black in every frame. "
+        "Adjust --crop or use --crop none."
+    ),
     FailureCategory.INPUT_NOT_FOUND: (
         "Input media was not found. Verify the source path and try again."
     ),

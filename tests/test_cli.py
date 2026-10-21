@@ -8,6 +8,7 @@ from pathlib import Path
 import av
 import numpy as np
 import png
+import pytest
 
 RGB_COLORS = [(40, 50, 60), (0, 0, 0), (200, 80, 20), (9, 150, 230)]
 PRESENTATION_TIMESTAMPS = [0, 1, 4, 10]
@@ -67,6 +68,30 @@ def test_installed_command_processes_all_variable_timestamp_frames(
     assert _read_barcode(output_path) == (4, 3, RGB_COLORS)
 
 
+def test_installed_command_applies_explicit_crop(tmp_path: Path) -> None:
+    """Apply one exact-black explicit picture region to every lossless frame."""
+    media_path = tmp_path / "explicit-crop-fixture.mkv"
+    output_path = tmp_path / "explicit-crop-barcode.png"
+    _write_explicit_crop_fixture(media_path)
+
+    completed_process = _run_cinebar(
+        [
+            str(media_path),
+            "--output",
+            str(output_path),
+            "--height",
+            "3",
+            "--workers",
+            "1",
+            "--crop",
+            "1,1,3,3",
+        ]
+    )
+
+    assert completed_process.returncode == 0, completed_process.stderr
+    assert _read_barcode(output_path) == (2, 3, [(60, 60, 60), (75, 30, 15)])
+
+
 def _write_lossless_fixture(media_path: Path) -> None:
     """Write a Matroska fixture with lossless bgr0 frames and uneven PTS values."""
     with av.open(str(media_path), mode="w", format="matroska") as container:
@@ -90,6 +115,29 @@ def _write_lossless_fixture(media_path: Path) -> None:
             container.mux(packet)
 
 
+def _write_explicit_crop_fixture(media_path: Path) -> None:
+    """Write lossless frames with a black border and black picture content."""
+    picture_colors = [(80, 80, 80), (100, 40, 20)]
+    with av.open(str(media_path), mode="w", format="matroska") as container:
+        stream = container.add_stream("ffv1", rate=24)
+        stream.width = 4
+        stream.height = 4
+        stream.pix_fmt = "bgr0"
+
+        for presentation_timestamp, picture_color in enumerate(picture_colors):
+            rgb_frame = np.zeros((4, 4, 3), dtype=np.uint8)
+            rgb_frame[1:3, 1:3] = picture_color
+            rgb_frame[1, 1] = (0, 0, 0)
+            frame = av.VideoFrame.from_ndarray(rgb_frame, format="rgb24")
+            frame.pts = presentation_timestamp
+            frame.time_base = Fraction(1, 24)
+            for packet in stream.encode(frame):
+                container.mux(packet)
+
+        for packet in stream.encode():
+            container.mux(packet)
+
+
 def _read_barcode(barcode_path: Path) -> tuple[int, int, list[tuple[int, int, int]]]:
     """Read dimensions and first-row RGB columns from a lossless barcode PNG."""
     with barcode_path.open("rb") as barcode_file:
@@ -103,6 +151,41 @@ def _read_barcode(barcode_path: Path) -> tuple[int, int, list[tuple[int, int, in
     ]
     assert pixel_rows == [first_row] * height
     return width, height, colors
+
+
+@pytest.mark.parametrize(
+    "crop_selection",
+    ["1,1,1,2", "1,1,2", "1,one,2,3"],
+)
+def test_installed_command_reports_invalid_explicit_crop_without_output(
+    tmp_path: Path,
+    crop_selection: str,
+) -> None:
+    """Report empty and malformed crop input without creating a barcode."""
+    media_path = tmp_path / "sensitive-source-name.mp4"
+    output_path = tmp_path / "barcode.png"
+
+    completed_process = _run_cinebar(
+        [
+            str(media_path),
+            "--output",
+            str(output_path),
+            "--crop",
+            crop_selection,
+        ]
+    )
+
+    _assert_installed_failure(
+        completed_process,
+        "invalid_crop",
+        (
+            "Explicit crop must use four non-negative integers as "
+            "LEFT,TOP,RIGHT,BOTTOM, define a non-empty rectangle, and fit every "
+            "decoded frame."
+        ),
+        media_path,
+    )
+    assert not output_path.exists()
 
 
 def test_installed_command_reports_missing_input_without_source_path(

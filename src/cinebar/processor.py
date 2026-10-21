@@ -1,4 +1,4 @@
-"""Public orchestration for one complete no-crop barcode."""
+"""Public orchestration for one complete barcode."""
 
 from collections.abc import Callable
 from io import BytesIO
@@ -9,12 +9,13 @@ from typing import BinaryIO, cast
 
 import png
 
+from .crop import CropRectangle
 from .errors import CinebarError, FailureCategory
 from .extract import extract_frame_colors
 from .models import ProcessingResult
 from .png import write_barcode_png
 
-FrameColorExtractor = Callable[[Path, int | None], bytes]
+FrameColorExtractor = Callable[[Path, int | None, CropRectangle | None], bytes]
 
 
 class SingleFileProcessor:
@@ -38,6 +39,7 @@ class SingleFileProcessor:
         height: int = 300,
         workers: int | None = None,
         overwrite: bool = False,
+        crop: CropRectangle | None = None,
     ) -> ProcessingResult:
         """Decode one media file and atomically publish its complete barcode.
 
@@ -47,6 +49,7 @@ class SingleFileProcessor:
             height: Requested barcode height in pixels.
             workers: Process count, or ``None`` for a safe automatic count.
             overwrite: Whether an existing final PNG may be replaced.
+            crop: Optional fixed picture region to validate and select per frame.
 
         Returns:
             Dimensions and path of the completed barcode PNG.
@@ -64,12 +67,14 @@ class SingleFileProcessor:
                 or workers <= 0
             ):
                 raise CinebarError(FailureCategory.INVALID_ARGUMENT)
+            if crop is not None and not isinstance(crop, CropRectangle):
+                raise CinebarError(FailureCategory.INVALID_CROP)
 
             if not overwrite:
                 _ensure_output_path_is_available(output_path)
             _validate_input_media(media_path)
 
-            compact_colors = self._frame_color_extractor(media_path, workers)
+            compact_colors = self._frame_color_extractor(media_path, workers, crop)
             if not compact_colors:
                 raise CinebarError(FailureCategory.ZERO_FRAMES)
             if len(compact_colors) % 3 != 0:

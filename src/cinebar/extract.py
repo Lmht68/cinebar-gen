@@ -12,6 +12,7 @@ import cv2
 import numpy as np
 from numpy.typing import NDArray
 
+from .crop import CropRectangle, apply_explicit_crop
 from .errors import CinebarError, FailureCategory
 
 MAX_AUTO_WORKERS = 16
@@ -77,18 +78,24 @@ def partition_frame_ranges(frame_count: int, workers: int) -> list[FrameRange]:
     return frame_ranges
 
 
-def extract_frame_colors(video_path: Path, workers: int | None = None) -> bytes:
+def extract_frame_colors(
+    video_path: Path,
+    workers: int | None = None,
+    crop: CropRectangle | None = None,
+) -> bytes:
     """Extract one ordered RGB frame color for every OpenCV-decoded frame.
 
     Args:
         video_path: Local media file to decode.
         workers: Process count, or ``None`` for a bounded automatic count.
+        crop: Optional fixed picture region to validate and select per frame.
 
     Returns:
         Three packed RGB bytes per decoded frame in source index order.
 
     Raises:
-        CinebarError: If decoding or parallel range validation fails.
+        CinebarError: If decoding, crop validation, or parallel range validation
+            fails.
         ValueError: If ``workers`` is not positive.
     """
     resolved_workers = (
@@ -97,7 +104,7 @@ def extract_frame_colors(video_path: Path, workers: int | None = None) -> bytes:
     if resolved_workers <= 0:
         raise ValueError("workers must be positive.")
     if resolved_workers == 1:
-        return _extract_frame_colors_sequentially(video_path)
+        return _extract_frame_colors_sequentially(video_path, crop)
 
     video_path_text = str(video_path)
     try:
@@ -121,7 +128,8 @@ def extract_frame_colors(video_path: Path, workers: int | None = None) -> bytes:
     frame_count = int(reported_frame_count)
     frame_ranges = partition_frame_ranges(frame_count, resolved_workers)
     tasks = [
-        (video_path_text, frame_range, frame_count) for frame_range in frame_ranges
+        (video_path_text, frame_range, frame_count, crop)
+        for frame_range in frame_ranges
     ]
     try:
         with Pool(processes=len(frame_ranges)) as pool:
@@ -138,7 +146,10 @@ def extract_frame_colors(video_path: Path, workers: int | None = None) -> bytes:
     )
 
 
-def _extract_frame_colors_sequentially(video_path: Path) -> bytes:
+def _extract_frame_colors_sequentially(
+    video_path: Path,
+    crop: CropRectangle | None,
+) -> bytes:
     """Extract complete ordered colors without frame-count metadata or seeking."""
     colors = bytearray()
     try:
@@ -151,7 +162,10 @@ def _extract_frame_colors_sequentially(video_path: Path) -> bytes:
                 if not success:
                     break
                 bgr_frame = _validate_decoded_frame(decoded_frame)
-                colors.extend(opencv_mean_frame_color(bgr_frame))
+                picture_region = (
+                    bgr_frame if crop is None else apply_explicit_crop(bgr_frame, crop)
+                )
+                colors.extend(opencv_mean_frame_color(picture_region))
         finally:
             capture.release()
     except cv2.error:
@@ -166,6 +180,7 @@ def extract_frame_range(
     video_path: str,
     frame_range: FrameRange,
     frame_count: int,
+    crop: CropRectangle | None = None,
 ) -> ExtractedFrameRange:
     """Extract one validated inclusive OpenCV frame range.
 
@@ -173,12 +188,13 @@ def extract_frame_range(
         video_path: Local media path.
         frame_range: Inclusive frame indexes assigned to this worker.
         frame_count: Positive reported frame count for the complete stream.
+        crop: Optional fixed picture region to validate and select per frame.
 
     Returns:
         Ordered compact RGB colors plus range-boundary evidence.
 
     Raises:
-        CinebarError: If the decoder cannot open, seek, or read the range.
+        CinebarError: If the decoder cannot open, seek, read, or crop the range.
     """
     if (
         frame_range.start < 0
@@ -208,8 +224,11 @@ def extract_frame_range(
                 _require_next_frame_position(capture, expected_index + 1)
                 if expected_index == frame_range.start:
                     first_frame_digest = sha256(bgr_frame).digest()
+                picture_region = (
+                    bgr_frame if crop is None else apply_explicit_crop(bgr_frame, crop)
+                )
                 colors[color_offset : color_offset + 3] = opencv_mean_frame_color(
-                    bgr_frame
+                    picture_region
                 )
                 color_offset += 3
 
