@@ -210,6 +210,7 @@ tempCodeRunnerFile.py
 
 # Documentation
 docs/
+data/
 
 # Agent
 AGENTS.md
