@@ -45,7 +45,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--height",
         type=_positive_integer,
-        default=300,
+        default=100,
         help="Barcode height in pixels. Defaults to 300.",
     )
     parser.add_argument(
