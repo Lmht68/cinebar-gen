@@ -12,6 +12,8 @@ import cv2
 import numpy as np
 from numpy.typing import NDArray
 
+from .errors import CinebarError, FailureCategory
+
 MAX_AUTO_WORKERS = 16
 
 
@@ -43,10 +45,6 @@ class ExtractedFrameRange:
     colors: bytes
     first_frame_digest: bytes
     following_frame_digest: bytes | None
-
-
-class FrameExtractionError(RuntimeError):
-    """Report unsafe or incomplete frame extraction."""
 
 
 def partition_frame_ranges(frame_count: int, workers: int) -> list[FrameRange]:
@@ -90,7 +88,7 @@ def extract_frame_colors(video_path: Path, workers: int | None = None) -> bytes:
         Three packed RGB bytes per decoded frame in source index order.
 
     Raises:
-        FrameExtractionError: If decoding or parallel range validation fails.
+        CinebarError: If decoding or parallel range validation fails.
         ValueError: If ``workers`` is not positive.
     """
     resolved_workers = (
@@ -102,34 +100,37 @@ def extract_frame_colors(video_path: Path, workers: int | None = None) -> bytes:
         return _extract_frame_colors_sequentially(video_path)
 
     video_path_text = str(video_path)
-    metadata_capture = cv2.VideoCapture(video_path_text)
     try:
-        if not metadata_capture.isOpened():
-            raise FrameExtractionError(f"Unable to open video: {video_path}")
-        reported_frame_count = metadata_capture.get(cv2.CAP_PROP_FRAME_COUNT)
-    finally:
-        metadata_capture.release()
+        metadata_capture = cv2.VideoCapture(video_path_text)
+        try:
+            if not metadata_capture.isOpened():
+                raise CinebarError(FailureCategory.NO_VIDEO_STREAM)
+            reported_frame_count = metadata_capture.get(cv2.CAP_PROP_FRAME_COUNT)
+        finally:
+            metadata_capture.release()
+    except cv2.error:
+        raise CinebarError(FailureCategory.DECODE_FAILED) from None
 
     if (
         not isfinite(reported_frame_count)
         or reported_frame_count <= 0
         or not reported_frame_count.is_integer()
     ):
-        raise FrameExtractionError(
-            "Parallel processing requires a positive integer OpenCV frame count. "
-            "Choose --workers 1 to decode sequentially."
-        )
+        raise CinebarError(FailureCategory.DECODE_FAILED)
 
     frame_count = int(reported_frame_count)
     frame_ranges = partition_frame_ranges(frame_count, resolved_workers)
     tasks = [
         (video_path_text, frame_range, frame_count) for frame_range in frame_ranges
     ]
-    with Pool(processes=len(frame_ranges)) as pool:
-        extracted_ranges: list[ExtractedFrameRange] = pool.starmap(
-            extract_frame_range,
-            tasks,
-        )
+    try:
+        with Pool(processes=len(frame_ranges)) as pool:
+            extracted_ranges: list[ExtractedFrameRange] = pool.starmap(
+                extract_frame_range,
+                tasks,
+            )
+    except cv2.error:
+        raise CinebarError(FailureCategory.DECODE_FAILED) from None
     return combine_extracted_frame_ranges(
         extracted_ranges,
         expected_ranges=frame_ranges,
@@ -139,23 +140,25 @@ def extract_frame_colors(video_path: Path, workers: int | None = None) -> bytes:
 
 def _extract_frame_colors_sequentially(video_path: Path) -> bytes:
     """Extract complete ordered colors without frame-count metadata or seeking."""
-    capture = cv2.VideoCapture(str(video_path))
+    colors = bytearray()
     try:
-        if not capture.isOpened():
-            raise FrameExtractionError(f"Unable to open video: {video_path}")
-        colors = bytearray()
-        while True:
-            success, bgr_frame = capture.read()
-            if not success:
-                break
-            if bgr_frame is None:
-                raise FrameExtractionError("Decoder returned an empty video frame.")
-            colors.extend(opencv_mean_frame_color(cast(NDArray[np.uint8], bgr_frame)))
-    finally:
-        capture.release()
+        capture = cv2.VideoCapture(str(video_path))
+        try:
+            if not capture.isOpened():
+                raise CinebarError(FailureCategory.NO_VIDEO_STREAM)
+            while True:
+                success, decoded_frame = capture.read()
+                if not success:
+                    break
+                bgr_frame = _validate_decoded_frame(decoded_frame)
+                colors.extend(opencv_mean_frame_color(bgr_frame))
+        finally:
+            capture.release()
+    except cv2.error:
+        raise CinebarError(FailureCategory.DECODE_FAILED) from None
 
     if not colors:
-        raise FrameExtractionError("No video frames were decoded.")
+        raise CinebarError(FailureCategory.ZERO_FRAMES)
     return bytes(colors)
 
 
@@ -175,65 +178,65 @@ def extract_frame_range(
         Ordered compact RGB colors plus range-boundary evidence.
 
     Raises:
-        FrameExtractionError: If the decoder cannot open, seek, or read the range.
-        ValueError: If the assigned range is outside ``frame_count``.
+        CinebarError: If the decoder cannot open, seek, or read the range.
     """
     if (
         frame_range.start < 0
         or frame_range.end < frame_range.start
         or frame_range.end >= frame_count
     ):
-        raise ValueError("frame_range must be within the reported frame count.")
+        raise CinebarError(FailureCategory.DECODE_FAILED)
 
-    capture = cv2.VideoCapture(video_path)
     try:
-        if not capture.isOpened():
-            raise FrameExtractionError(f"Unable to open video: {video_path}")
-        if not capture.set(cv2.CAP_PROP_POS_FRAMES, float(frame_range.start)):
-            raise FrameExtractionError(f"Unable to seek to frame {frame_range.start}.")
-        _require_next_frame_position(capture, frame_range.start)
+        capture = cv2.VideoCapture(video_path)
+        try:
+            if not capture.isOpened():
+                raise CinebarError(FailureCategory.DECODE_FAILED)
+            if not capture.set(cv2.CAP_PROP_POS_FRAMES, float(frame_range.start)):
+                raise CinebarError(FailureCategory.DECODE_FAILED)
+            _require_next_frame_position(capture, frame_range.start)
 
-        range_length = frame_range.end - frame_range.start + 1
-        colors = bytearray(range_length * 3)
-        first_frame_digest = b""
-        color_offset = 0
-        for expected_index in range(frame_range.start, frame_range.end + 1):
-            success, bgr_frame = capture.read()
-            if not success or bgr_frame is None:
-                raise FrameExtractionError(
-                    f"Decoder stopped before frame {expected_index}."
+            range_length = frame_range.end - frame_range.start + 1
+            colors = bytearray(range_length * 3)
+            first_frame_digest = b""
+            color_offset = 0
+            for expected_index in range(frame_range.start, frame_range.end + 1):
+                success, decoded_frame = capture.read()
+                if not success:
+                    raise CinebarError(FailureCategory.DECODE_FAILED)
+                bgr_frame = _validate_decoded_frame(decoded_frame)
+                _require_next_frame_position(capture, expected_index + 1)
+                if expected_index == frame_range.start:
+                    first_frame_digest = sha256(bgr_frame).digest()
+                colors[color_offset : color_offset + 3] = opencv_mean_frame_color(
+                    bgr_frame
                 )
-            bgr_frame = cast(NDArray[np.uint8], bgr_frame)
-            _require_next_frame_position(capture, expected_index + 1)
-            if expected_index == frame_range.start:
-                first_frame_digest = sha256(bgr_frame).digest()
-            colors[color_offset : color_offset + 3] = opencv_mean_frame_color(bgr_frame)
-            color_offset += 3
+                color_offset += 3
 
-        following_frame_digest: bytes | None = None
-        if frame_range.end + 1 < frame_count:
-            success, following_frame = capture.read()
-            if not success or following_frame is None:
-                raise FrameExtractionError(
-                    f"Decoder stopped before overlap frame {frame_range.end + 1}."
-                )
-            _require_next_frame_position(capture, frame_range.end + 2)
-            following_frame_digest = sha256(following_frame).digest()
-        else:
-            success, _ = capture.read()
-            if success:
-                raise FrameExtractionError(
-                    "Reported frame count excludes decodable trailing frames."
-                )
+            following_frame_digest: bytes | None = None
+            if frame_range.end + 1 < frame_count:
+                success, decoded_frame = capture.read()
+                if not success:
+                    raise CinebarError(FailureCategory.DECODE_FAILED)
+                following_frame = _validate_decoded_frame(decoded_frame)
+                _require_next_frame_position(capture, frame_range.end + 2)
+                following_frame_digest = sha256(following_frame).digest()
+            else:
+                success, decoded_frame = capture.read()
+                if success:
+                    _validate_decoded_frame(decoded_frame)
+                    raise CinebarError(FailureCategory.DECODE_FAILED)
 
-        return ExtractedFrameRange(
-            frame_range=frame_range,
-            colors=bytes(colors),
-            first_frame_digest=first_frame_digest,
-            following_frame_digest=following_frame_digest,
-        )
-    finally:
-        capture.release()
+            return ExtractedFrameRange(
+                frame_range=frame_range,
+                colors=bytes(colors),
+                first_frame_digest=first_frame_digest,
+                following_frame_digest=following_frame_digest,
+            )
+        finally:
+            capture.release()
+    except cv2.error:
+        raise CinebarError(FailureCategory.DECODE_FAILED) from None
 
 
 def combine_extracted_frame_ranges(
@@ -252,18 +255,16 @@ def combine_extracted_frame_ranges(
         Three packed RGB bytes for every expected frame.
 
     Raises:
-        FrameExtractionError: If coverage, ordering, or boundary evidence differs.
+        CinebarError: If coverage, ordering, or boundary evidence differs.
     """
     if len(extracted_ranges) != len(expected_ranges):
-        raise FrameExtractionError(
-            "Worker result count does not match submitted ranges."
-        )
+        raise CinebarError(FailureCategory.DECODE_FAILED)
     if (
         not expected_ranges
         or expected_ranges[0].start != 0
         or expected_ranges[-1].end != frame_count - 1
     ):
-        raise FrameExtractionError("Submitted ranges do not cover the reported video.")
+        raise CinebarError(FailureCategory.DECODE_FAILED)
 
     compact_colors = bytearray(frame_count * 3)
     color_offset = 0
@@ -272,29 +273,20 @@ def combine_extracted_frame_ranges(
         expected_ranges, extracted_ranges, strict=True
     ):
         if extracted_range.frame_range != expected_range:
-            raise FrameExtractionError(
-                "Worker result order does not match frame ranges."
-            )
+            raise CinebarError(FailureCategory.DECODE_FAILED)
         expected_color_bytes = (expected_range.end - expected_range.start + 1) * 3
         if len(extracted_range.colors) != expected_color_bytes:
-            raise FrameExtractionError(
-                f"Frame range {expected_range.start}-{expected_range.end} "
-                "returned an incomplete color sequence."
-            )
+            raise CinebarError(FailureCategory.DECODE_FAILED)
         if expected_range.start > 0:
             if previous_result is None:
-                raise FrameExtractionError(
-                    "Worker results omit a preceding contiguous frame range."
-                )
+                raise CinebarError(FailureCategory.DECODE_FAILED)
             if previous_result.frame_range.end + 1 != expected_range.start:
-                raise FrameExtractionError("Submitted frame ranges are not contiguous.")
+                raise CinebarError(FailureCategory.DECODE_FAILED)
             if (
                 previous_result.following_frame_digest
                 != extracted_range.first_frame_digest
             ):
-                raise FrameExtractionError(
-                    f"Decoder seek validation failed at frame {expected_range.start}."
-                )
+                raise CinebarError(FailureCategory.DECODE_FAILED)
 
         next_offset = color_offset + expected_color_bytes
         compact_colors[color_offset:next_offset] = extracted_range.colors
@@ -302,10 +294,22 @@ def combine_extracted_frame_ranges(
         previous_result = extracted_range
 
     if previous_result is None or previous_result.following_frame_digest is not None:
-        raise FrameExtractionError(
-            "Final worker did not validate the reported video end."
-        )
+        raise CinebarError(FailureCategory.DECODE_FAILED)
     return bytes(compact_colors)
+
+
+def _validate_decoded_frame(decoded_frame: object) -> NDArray[np.uint8]:
+    """Require OpenCV to return a contiguous non-empty 8-bit BGR frame."""
+    if (
+        not isinstance(decoded_frame, np.ndarray)
+        or decoded_frame.dtype != np.uint8
+        or decoded_frame.ndim != 3
+        or decoded_frame.size == 0
+        or decoded_frame.shape[2] != 3
+        or not decoded_frame.flags.c_contiguous
+    ):
+        raise CinebarError(FailureCategory.CORRUPT_FRAME)
+    return cast(NDArray[np.uint8], decoded_frame)
 
 
 def _require_next_frame_position(
@@ -315,10 +319,7 @@ def _require_next_frame_position(
     """Require OpenCV to report the expected next frame index."""
     actual_index = capture.get(cv2.CAP_PROP_POS_FRAMES)
     if actual_index != float(expected_index):
-        raise FrameExtractionError(
-            f"Decoder reported frame position {actual_index}, "
-            f"expected {expected_index}."
-        )
+        raise CinebarError(FailureCategory.DECODE_FAILED)
 
 
 def opencv_mean_frame_color(bgr_frame: NDArray[np.uint8]) -> bytes:

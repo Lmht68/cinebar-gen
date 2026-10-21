@@ -16,6 +16,14 @@ uv sync
 uv run cinebar movie.mp4 --output movie-barcode.png --height 300 --crop none
 ```
 
+Cinebar refuses to replace an existing barcode by default.
+Use `--overwrite` only when intentional replacement is required.
+The new PNG is fully encoded to a temporary file on the destination filesystem before it replaces the final output.
+
+```console
+uv run cinebar movie.mp4 --output movie-barcode.png --height 300 --crop none --overwrite
+```
+
 Cinebar defaults to at most 16 worker processes.
 Set `--workers N` to choose the process count or `--workers 1` to decode sequentially without frame-count metadata or random seeking.
 

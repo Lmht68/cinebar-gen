@@ -12,9 +12,9 @@ import pytest
 from numpy.typing import NDArray
 
 import cinebar.extract as extract_module
+from cinebar import CinebarError, FailureCategory
 from cinebar.extract import (
     ExtractedFrameRange,
-    FrameExtractionError,
     FrameRange,
     combine_extracted_frame_ranges,
     extract_frame_colors,
@@ -207,12 +207,11 @@ def test_combine_extracted_frame_ranges_rejects_boundary_mismatch() -> None:
         ),
     ]
 
-    with pytest.raises(
-        FrameExtractionError,
-        match="seek validation failed at frame 1",
-    ):
+    with pytest.raises(CinebarError) as raised_error:
         combine_extracted_frame_ranges(
             extracted_ranges,
             expected_ranges=[first_range, second_range],
             frame_count=2,
         )
+
+    assert raised_error.value.category is FailureCategory.DECODE_FAILED

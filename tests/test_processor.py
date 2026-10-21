@@ -1,11 +1,281 @@
 """Behavior tests for no-crop barcode processing."""
 
+import pickle
 from pathlib import Path
+from typing import BinaryIO
 
+import cv2
+import numpy as np
 import png
 import pytest
 
+from cinebar import CinebarError, FailureCategory
 from cinebar.processor import SingleFileProcessor
+
+
+@pytest.mark.parametrize(
+    ("category", "message"),
+    [
+        (
+            FailureCategory.INVALID_ARGUMENT,
+            "Invalid command-line arguments. Run 'cinebar --help' for usage.",
+        ),
+        (FailureCategory.INVALID_HEIGHT, "Height must be a positive integer."),
+        (
+            FailureCategory.INPUT_NOT_FOUND,
+            "Input media was not found. Verify the source path and try again.",
+        ),
+        (
+            FailureCategory.INPUT_UNREADABLE,
+            (
+                "Input media is not a readable regular file. Check its permissions "
+                "and file type."
+            ),
+        ),
+        (
+            FailureCategory.NO_VIDEO_STREAM,
+            "Input media has no usable video stream. Choose a supported video file.",
+        ),
+        (
+            FailureCategory.ZERO_FRAMES,
+            (
+                "The video stream decoded zero frames. Verify that the media is not "
+                "empty or damaged."
+            ),
+        ),
+        (
+            FailureCategory.DECODE_FAILED,
+            (
+                "Video decoding failed before completion. Check that the media is not "
+                "damaged; when using multiple workers, retry with --workers 1."
+            ),
+        ),
+        (
+            FailureCategory.CORRUPT_FRAME,
+            (
+                "The decoder returned a corrupt video frame. Verify or transcode the "
+                "source media."
+            ),
+        ),
+        (
+            FailureCategory.OUTPUT_EXISTS,
+            "Output already exists. Use --overwrite to replace it intentionally.",
+        ),
+        (
+            FailureCategory.OUTPUT_WRITE_FAILED,
+            (
+                "The barcode could not be written. Check destination permissions and "
+                "available space."
+            ),
+        ),
+        (
+            FailureCategory.INTERRUPTED,
+            "Processing was interrupted; no new barcode was published.",
+        ),
+    ],
+)
+def test_cinebar_error_is_picklable_and_path_safe(
+    category: FailureCategory, message: str
+) -> None:
+    """Expose one stable picklable failure interface with safe fixed messages."""
+    error = CinebarError(category)
+
+    restored_error = pickle.loads(pickle.dumps(error))
+
+    assert error.args == (category,)
+    assert error.category is category
+    assert str(error) == message
+    assert restored_error.category is category
+    assert str(restored_error) == message
+
+
+class _SequentialCapture:
+    """Minimal opened capture returning predetermined sequential read results."""
+
+    def __init__(
+        self,
+        read_results: list[tuple[bool, object | None] | BaseException],
+    ) -> None:
+        """Store sequential reads and initialize their current index."""
+        self._read_results = tuple(read_results)
+        self._next_read_index = 0
+
+    def isOpened(self) -> bool:
+        """Report that the synthetic capture opened."""
+        return True
+
+    def read(self) -> tuple[bool, object | None]:
+        """Return the next result or the normal end-of-stream sentinel."""
+        if self._next_read_index >= len(self._read_results):
+            return False, None
+
+        read_result = self._read_results[self._next_read_index]
+        self._next_read_index += 1
+        if isinstance(read_result, BaseException):
+            raise read_result
+        return read_result
+
+    def release(self) -> None:
+        """Release the synthetic capture."""
+
+
+def test_process_classifies_zero_decoded_frames(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reject an opened source whose sequential decoder yields no frames."""
+    media_path = tmp_path / "source.mkv"
+    output_path = tmp_path / "barcode.png"
+    media_path.write_bytes(b"placeholder")
+    capture = _SequentialCapture([])
+    monkeypatch.setattr(cv2, "VideoCapture", lambda _: capture)
+
+    with pytest.raises(CinebarError) as raised_error:
+        SingleFileProcessor().process(media_path, output_path, workers=1)
+
+    assert raised_error.value.category is FailureCategory.ZERO_FRAMES
+    assert not output_path.exists()
+    assert not list(tmp_path.glob(f".{output_path.name}.*.tmp"))
+
+
+def test_process_classifies_decoder_exception(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reject an OpenCV decoder exception without publishing a barcode."""
+    media_path = tmp_path / "source.mkv"
+    output_path = tmp_path / "barcode.png"
+    media_path.write_bytes(b"placeholder")
+    capture = _SequentialCapture([cv2.error("decoder failure")])
+    monkeypatch.setattr(cv2, "VideoCapture", lambda _: capture)
+
+    with pytest.raises(CinebarError) as raised_error:
+        SingleFileProcessor().process(media_path, output_path, workers=1)
+
+    assert raised_error.value.category is FailureCategory.DECODE_FAILED
+    assert not output_path.exists()
+    assert not list(tmp_path.glob(f".{output_path.name}.*.tmp"))
+
+
+def test_process_rejects_malformed_decoded_frame(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reject a non-uint8 decoded frame without publishing a barcode."""
+    media_path = tmp_path / "source.mkv"
+    output_path = tmp_path / "barcode.png"
+    media_path.write_bytes(b"placeholder")
+    capture = _SequentialCapture([(True, np.ones((1, 1, 3), dtype=np.int16))])
+    monkeypatch.setattr(cv2, "VideoCapture", lambda _: capture)
+
+    with pytest.raises(CinebarError) as raised_error:
+        SingleFileProcessor().process(media_path, output_path, workers=1)
+
+    assert raised_error.value.category is FailureCategory.CORRUPT_FRAME
+    assert not output_path.exists()
+    assert not list(tmp_path.glob(f".{output_path.name}.*.tmp"))
+
+
+@pytest.mark.parametrize("height", [0, -1])
+def test_process_rejects_non_positive_height_before_media_access(
+    tmp_path: Path, height: int
+) -> None:
+    """Reject invalid heights before accessing the source or calling the extractor."""
+    color_extractor_called = False
+
+    def extract_colors(_: Path, __: int | None) -> bytes:
+        nonlocal color_extractor_called
+        color_extractor_called = True
+        return b""
+
+    with pytest.raises(CinebarError) as raised_error:
+        SingleFileProcessor(extract_colors).process(
+            tmp_path / "missing-source.mkv",
+            tmp_path / "barcode.png",
+            height=height,
+        )
+
+    assert raised_error.value.category is FailureCategory.INVALID_HEIGHT
+    assert color_extractor_called is False
+
+
+@pytest.mark.parametrize("workers", [0, -1])
+def test_process_rejects_non_positive_worker_count_before_media_access(
+    tmp_path: Path, workers: int
+) -> None:
+    """Reject an explicit invalid worker count before accessing the source."""
+    color_extractor_called = False
+
+    def extract_colors(_: Path, __: int | None) -> bytes:
+        nonlocal color_extractor_called
+        color_extractor_called = True
+        return b""
+
+    with pytest.raises(CinebarError) as raised_error:
+        SingleFileProcessor(extract_colors).process(
+            tmp_path / "missing-source.mkv",
+            tmp_path / "barcode.png",
+            workers=workers,
+        )
+
+    assert raised_error.value.category is FailureCategory.INVALID_ARGUMENT
+    assert color_extractor_called is False
+
+
+def test_process_refuses_existing_output_before_decoding(tmp_path: Path) -> None:
+    """Preserve an existing output unless callers intentionally request replacement."""
+    media_path = tmp_path / "source.mkv"
+    output_path = tmp_path / "barcode.png"
+    media_path.write_bytes(b"placeholder")
+    output_path.write_bytes(b"existing barcode")
+    color_extractor_called = False
+
+    def extract_colors(_: Path, __: int | None) -> bytes:
+        nonlocal color_extractor_called
+        color_extractor_called = True
+        return bytes((1, 2, 3))
+
+    with pytest.raises(CinebarError) as raised_error:
+        SingleFileProcessor(extract_colors).process(media_path, output_path)
+
+    assert raised_error.value.category is FailureCategory.OUTPUT_EXISTS
+    assert output_path.read_bytes() == b"existing barcode"
+    assert color_extractor_called is False
+
+
+def test_process_rejects_missing_input_before_decoding(tmp_path: Path) -> None:
+    """Classify a missing source without calling the decoder or publishing output."""
+    output_path = tmp_path / "barcode.png"
+    color_extractor_called = False
+
+    def extract_colors(_: Path, __: int | None) -> bytes:
+        nonlocal color_extractor_called
+        color_extractor_called = True
+        return bytes((1, 2, 3))
+
+    with pytest.raises(CinebarError) as raised_error:
+        SingleFileProcessor(extract_colors).process(
+            tmp_path / "missing-source.mkv", output_path
+        )
+
+    assert raised_error.value.category is FailureCategory.INPUT_NOT_FOUND
+    assert color_extractor_called is False
+    assert not output_path.exists()
+
+
+def test_process_rejects_non_regular_input_before_decoding(tmp_path: Path) -> None:
+    """Classify a directory source without calling the decoder or publishing output."""
+    output_path = tmp_path / "barcode.png"
+    color_extractor_called = False
+
+    def extract_colors(_: Path, __: int | None) -> bytes:
+        nonlocal color_extractor_called
+        color_extractor_called = True
+        return bytes((1, 2, 3))
+
+    with pytest.raises(CinebarError) as raised_error:
+        SingleFileProcessor(extract_colors).process(tmp_path, output_path)
+
+    assert raised_error.value.category is FailureCategory.INPUT_UNREADABLE
+    assert color_extractor_called is False
+    assert not output_path.exists()
 
 
 def test_process_writes_ordered_colors_with_black_frame(tmp_path: Path) -> None:
@@ -33,9 +303,11 @@ def test_process_writes_ordered_colors_with_black_frame(tmp_path: Path) -> None:
     def extract_colors(_: Path, __: int | None) -> bytes:
         return compact_colors
 
+    media_path = tmp_path / "source.mkv"
     output_path = tmp_path / "barcode.png"
+    media_path.write_bytes(b"placeholder")
     result = SingleFileProcessor(extract_colors).process(
-        Path("source.mkv"), output_path, height=2, workers=2
+        media_path, output_path, height=2, workers=2
     )
 
     with output_path.open("rb") as barcode_file:
@@ -71,10 +343,12 @@ def test_process_writes_ordered_colors_with_black_frame(tmp_path: Path) -> None:
 def test_process_defaults_to_300_pixel_height(tmp_path: Path) -> None:
     """Publish a 300-pixel-tall PNG when height is omitted."""
     compact_colors = bytes((0, 0, 0))
+    media_path = tmp_path / "source.mkv"
     output_path = tmp_path / "default-height.png"
+    media_path.write_bytes(b"placeholder")
 
     result = SingleFileProcessor(lambda _path, _workers: compact_colors).process(
-        Path("source.mkv"), output_path
+        media_path, output_path
     )
 
     with output_path.open("rb") as barcode_file:
@@ -87,33 +361,190 @@ def test_process_defaults_to_300_pixel_height(tmp_path: Path) -> None:
     assert actual_rows == [[0, 0, 0]] * 300
 
 
-@pytest.mark.parametrize("height", [0, -1])
-def test_process_rejects_non_positive_height_before_decoding(
-    tmp_path: Path, height: int
-) -> None:
-    """Reject invalid dimensions before the frame-source factory is called."""
-    color_extractor_called = False
-
-    def extract_colors(_: Path, __: int | None) -> bytes:
-        nonlocal color_extractor_called
-        color_extractor_called = True
-        return b""
-
-    with pytest.raises(ValueError, match="height must be positive"):
-        SingleFileProcessor(extract_colors).process(
-            Path("source.mkv"), tmp_path / "barcode.png", height=height
-        )
-
-    assert color_extractor_called is False
-
-
 def test_process_rejects_empty_decode_before_creating_output(tmp_path: Path) -> None:
     """Reject an empty frame source without publishing a barcode file."""
+    media_path = tmp_path / "source.mkv"
     output_path = tmp_path / "barcode.png"
+    media_path.write_bytes(b"placeholder")
 
-    with pytest.raises(ValueError, match="No video frames were decoded"):
+    with pytest.raises(CinebarError) as raised_error:
         SingleFileProcessor(lambda _path, _workers: b"").process(
-            Path("source.mkv"), output_path
+            media_path, output_path
         )
 
+    assert raised_error.value.category is FailureCategory.ZERO_FRAMES
     assert not output_path.exists()
+    assert not list(tmp_path.glob(f".{output_path.name}.*.tmp"))
+
+
+def test_process_rejects_incomplete_frame_colors_before_creating_output(
+    tmp_path: Path,
+) -> None:
+    """Reject an incomplete extracted RGB sequence without publishing a barcode."""
+    media_path = tmp_path / "source.mkv"
+    output_path = tmp_path / "barcode.png"
+    media_path.write_bytes(b"placeholder")
+
+    with pytest.raises(CinebarError) as raised_error:
+        SingleFileProcessor(lambda _path, _workers: bytes((1, 2))).process(
+            media_path, output_path
+        )
+
+    assert raised_error.value.category is FailureCategory.CORRUPT_FRAME
+    assert not output_path.exists()
+    assert not list(tmp_path.glob(f".{output_path.name}.*.tmp"))
+
+
+def test_process_overwrite_replaces_output_with_complete_png(tmp_path: Path) -> None:
+    """Replace a prior output only when callers explicitly request it."""
+    media_path = tmp_path / "source.mkv"
+    output_path = tmp_path / "barcode.png"
+    media_path.write_bytes(b"placeholder")
+    output_path.write_bytes(b"previous barcode")
+    compact_colors = bytes((10, 20, 30, 40, 50, 60))
+
+    SingleFileProcessor(lambda _path, _workers: compact_colors).process(
+        media_path,
+        output_path,
+        height=2,
+        overwrite=True,
+    )
+
+    with output_path.open("rb") as barcode_file:
+        width, height, rows, _ = png.Reader(file=barcode_file).read()
+        actual_rows = [list(row) for row in rows]
+
+    assert width == 2
+    assert height == 2
+    assert actual_rows == [[10, 20, 30, 40, 50, 60]] * 2
+    assert not list(tmp_path.glob(f".{output_path.name}.*.tmp"))
+
+
+def test_process_encodes_open_destination_temporary_before_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Keep the existing final output untouched while encoding a temporary PNG."""
+    media_path = tmp_path / "source.mkv"
+    output_path = tmp_path / "barcode.png"
+    media_path.write_bytes(b"placeholder")
+    output_path.write_bytes(b"previous barcode")
+    original_write = png.Writer.write
+    observed_temporary_paths: list[Path] = []
+
+    def observe_write(writer: object, output_file: BinaryIO, rows: object) -> None:
+        temporary_path = Path(output_file.name)
+        observed_temporary_paths.append(temporary_path)
+        assert output_file.closed is False
+        assert temporary_path.parent == output_path.parent
+        assert temporary_path != output_path
+        assert output_path.read_bytes() == b"previous barcode"
+        original_write(writer, output_file, rows)
+
+    monkeypatch.setattr(png.Writer, "write", observe_write)
+
+    SingleFileProcessor(lambda _path, _workers: bytes((1, 2, 3))).process(
+        media_path,
+        output_path,
+        overwrite=True,
+    )
+
+    assert len(observed_temporary_paths) == 1
+    assert not list(tmp_path.glob(f".{output_path.name}.*.tmp"))
+
+
+def test_process_removes_temporary_after_partial_write_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Preserve the final output when encoding writes only a partial PNG."""
+    media_path = tmp_path / "source.mkv"
+    output_path = tmp_path / "barcode.png"
+    media_path.write_bytes(b"placeholder")
+    output_path.write_bytes(b"previous barcode")
+
+    def raise_partial_write(_: object, output_file: BinaryIO, __: object) -> None:
+        output_file.write(b"partial PNG")
+        raise OSError("write failure")
+
+    monkeypatch.setattr(png.Writer, "write", raise_partial_write)
+
+    with pytest.raises(CinebarError) as raised_error:
+        SingleFileProcessor(lambda _path, _workers: bytes((1, 2, 3))).process(
+            media_path,
+            output_path,
+            overwrite=True,
+        )
+
+    assert raised_error.value.category is FailureCategory.OUTPUT_WRITE_FAILED
+    assert output_path.read_bytes() == b"previous barcode"
+    assert not list(tmp_path.glob(f".{output_path.name}.*.tmp"))
+
+
+def test_process_removes_temporary_after_interruption(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Preserve the final output when encoding is interrupted."""
+    media_path = tmp_path / "source.mkv"
+    output_path = tmp_path / "barcode.png"
+    media_path.write_bytes(b"placeholder")
+    output_path.write_bytes(b"previous barcode")
+
+    def raise_interruption(_: object, __: BinaryIO, ___: object) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(png.Writer, "write", raise_interruption)
+
+    with pytest.raises(CinebarError) as raised_error:
+        SingleFileProcessor(lambda _path, _workers: bytes((1, 2, 3))).process(
+            media_path,
+            output_path,
+            overwrite=True,
+        )
+
+    assert raised_error.value.category is FailureCategory.INTERRUPTED
+    assert output_path.read_bytes() == b"previous barcode"
+    assert not list(tmp_path.glob(f".{output_path.name}.*.tmp"))
+
+
+def test_process_refuses_output_created_while_encoding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Leave a competing publisher's final output untouched before replacement."""
+    media_path = tmp_path / "source.mkv"
+    output_path = tmp_path / "barcode.png"
+    media_path.write_bytes(b"placeholder")
+    original_write = png.Writer.write
+
+    def create_competing_output(
+        writer: object, output_file: BinaryIO, rows: object
+    ) -> None:
+        original_write(writer, output_file, rows)
+        output_path.write_bytes(b"competing barcode")
+
+    monkeypatch.setattr(png.Writer, "write", create_competing_output)
+
+    with pytest.raises(CinebarError) as raised_error:
+        SingleFileProcessor(lambda _path, _workers: bytes((1, 2, 3))).process(
+            media_path,
+            output_path,
+        )
+
+    assert raised_error.value.category is FailureCategory.OUTPUT_EXISTS
+    assert output_path.read_bytes() == b"competing barcode"
+    assert not list(tmp_path.glob(f".{output_path.name}.*.tmp"))
+
+
+def test_process_classifies_interruption_during_decoding(tmp_path: Path) -> None:
+    """Classify decoding interruption before any temporary output is created."""
+    media_path = tmp_path / "source.mkv"
+    output_path = tmp_path / "barcode.png"
+    media_path.write_bytes(b"placeholder")
+
+    def interrupt_decoding(_: Path, __: int | None) -> bytes:
+        raise KeyboardInterrupt
+
+    with pytest.raises(CinebarError) as raised_error:
+        SingleFileProcessor(interrupt_decoding).process(media_path, output_path)
+
+    assert raised_error.value.category is FailureCategory.INTERRUPTED
+    assert not output_path.exists()
+    assert not list(tmp_path.glob(f".{output_path.name}.*.tmp"))

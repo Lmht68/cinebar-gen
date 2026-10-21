@@ -13,6 +13,30 @@ RGB_COLORS = [(40, 50, 60), (0, 0, 0), (200, 80, 20), (9, 150, 230)]
 PRESENTATION_TIMESTAMPS = [0, 1, 4, 10]
 
 
+def _run_cinebar(arguments: list[str]) -> subprocess.CompletedProcess[str]:
+    """Run the installed Cinebar command with captured text output."""
+    cinebar_executable = shutil.which("cinebar")
+    assert cinebar_executable is not None, "Installed cinebar executable was not found."
+    return subprocess.run(
+        [cinebar_executable, *arguments],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+
+def _assert_installed_failure(
+    completed_process: subprocess.CompletedProcess[str],
+    category: str,
+    message: str,
+    sensitive_media_path: Path,
+) -> None:
+    """Require one safe, actionable installed-command failure."""
+    assert completed_process.returncode != 0
+    assert completed_process.stderr == f"ERROR [{category}] {message}\n"
+    assert str(sensitive_media_path) not in completed_process.stderr
+
+
 def test_installed_command_processes_all_variable_timestamp_frames(
     tmp_path: Path,
 ) -> None:
@@ -25,11 +49,8 @@ def test_installed_command_processes_all_variable_timestamp_frames(
         selected_stream = fixture.streams.video[0]
         assert selected_stream.frames == 0
 
-    cinebar_executable = shutil.which("cinebar")
-    assert cinebar_executable is not None, "Installed cinebar executable was not found."
-    completed_process = subprocess.run(
+    completed_process = _run_cinebar(
         [
-            cinebar_executable,
             str(media_path),
             "--output",
             str(output_path),
@@ -39,10 +60,7 @@ def test_installed_command_processes_all_variable_timestamp_frames(
             "1",
             "--crop",
             "none",
-        ],
-        check=False,
-        capture_output=True,
-        text=True,
+        ]
     )
 
     assert completed_process.returncode == 0, completed_process.stderr
@@ -85,3 +103,218 @@ def _read_barcode(barcode_path: Path) -> tuple[int, int, list[tuple[int, int, in
     ]
     assert pixel_rows == [first_row] * height
     return width, height, colors
+
+
+def test_installed_command_reports_missing_input_without_source_path(
+    tmp_path: Path,
+) -> None:
+    """Report a missing source through the safe installed-command failure boundary."""
+    media_path = tmp_path / "sensitive-source-name.mp4"
+    output_path = tmp_path / "barcode.png"
+
+    completed_process = _run_cinebar(
+        [
+            str(media_path),
+            "--output",
+            str(output_path),
+            "--workers",
+            "1",
+            "--crop",
+            "none",
+        ]
+    )
+
+    _assert_installed_failure(
+        completed_process,
+        "input_not_found",
+        "Input media was not found. Verify the source path and try again.",
+        media_path,
+    )
+    assert not output_path.exists()
+
+
+def test_installed_command_reports_non_regular_input_without_source_path(
+    tmp_path: Path,
+) -> None:
+    """Report a directory source through the safe installed-command boundary."""
+    media_path = tmp_path / "sensitive-source-directory"
+    output_path = tmp_path / "barcode.png"
+    media_path.mkdir()
+
+    completed_process = _run_cinebar(
+        [
+            str(media_path),
+            "--output",
+            str(output_path),
+            "--workers",
+            "1",
+            "--crop",
+            "none",
+        ]
+    )
+
+    _assert_installed_failure(
+        completed_process,
+        "input_unreadable",
+        (
+            "Input media is not a readable regular file. Check its permissions and "
+            "file type."
+        ),
+        media_path,
+    )
+    assert not output_path.exists()
+
+
+def test_installed_command_reports_media_without_video_stream(
+    tmp_path: Path,
+) -> None:
+    """Report readable non-video media without publishing an output."""
+    media_path = tmp_path / "sensitive-source.txt"
+    output_path = tmp_path / "barcode.png"
+    media_path.write_text("not a video", encoding="utf-8")
+
+    completed_process = _run_cinebar(
+        [
+            str(media_path),
+            "--output",
+            str(output_path),
+            "--workers",
+            "1",
+            "--crop",
+            "none",
+        ]
+    )
+
+    _assert_installed_failure(
+        completed_process,
+        "no_video_stream",
+        "Input media has no usable video stream. Choose a supported video file.",
+        media_path,
+    )
+    assert not output_path.exists()
+
+
+def test_installed_command_reports_malformed_height_without_source_path(
+    tmp_path: Path,
+) -> None:
+    """Route malformed heights through the safe logging boundary."""
+    media_path = tmp_path / "sensitive-source-name.mp4"
+    output_path = tmp_path / "barcode.png"
+
+    completed_process = _run_cinebar(
+        [
+            str(media_path),
+            "--output",
+            str(output_path),
+            "--height",
+            "not-an-integer",
+        ]
+    )
+
+    _assert_installed_failure(
+        completed_process,
+        "invalid_height",
+        "Height must be a positive integer.",
+        media_path,
+    )
+    assert not output_path.exists()
+
+
+def test_installed_command_reports_non_positive_height_without_source_path(
+    tmp_path: Path,
+) -> None:
+    """Route non-positive heights through the safe logging boundary."""
+    media_path = tmp_path / "sensitive-source-name.mp4"
+    output_path = tmp_path / "barcode.png"
+
+    completed_process = _run_cinebar(
+        [
+            str(media_path),
+            "--output",
+            str(output_path),
+            "--height",
+            "0",
+        ]
+    )
+
+    _assert_installed_failure(
+        completed_process,
+        "invalid_height",
+        "Height must be a positive integer.",
+        media_path,
+    )
+    assert not output_path.exists()
+
+
+def test_installed_command_routes_parser_errors_through_logging(
+    tmp_path: Path,
+) -> None:
+    """Report parser failures without echoing sensitive media paths."""
+    media_path = tmp_path / "sensitive-source-name.mp4"
+
+    completed_process = _run_cinebar([str(media_path)])
+
+    _assert_installed_failure(
+        completed_process,
+        "invalid_argument",
+        "Invalid command-line arguments. Run 'cinebar --help' for usage.",
+        media_path,
+    )
+
+
+def test_installed_command_preserves_existing_output_without_overwrite(
+    tmp_path: Path,
+) -> None:
+    """Refuse to replace a final barcode unless callers request it."""
+    media_path = tmp_path / "sensitive-source.mkv"
+    output_path = tmp_path / "barcode.png"
+    _write_lossless_fixture(media_path)
+    output_path.write_bytes(b"previous barcode")
+
+    completed_process = _run_cinebar(
+        [
+            str(media_path),
+            "--output",
+            str(output_path),
+            "--workers",
+            "1",
+            "--crop",
+            "none",
+        ]
+    )
+
+    _assert_installed_failure(
+        completed_process,
+        "output_exists",
+        "Output already exists. Use --overwrite to replace it intentionally.",
+        media_path,
+    )
+    assert output_path.read_bytes() == b"previous barcode"
+
+
+def test_installed_command_replaces_existing_output_with_overwrite(
+    tmp_path: Path,
+) -> None:
+    """Replace an existing output only when the installed command is explicit."""
+    media_path = tmp_path / "fixture.mkv"
+    output_path = tmp_path / "barcode.png"
+    _write_lossless_fixture(media_path)
+    output_path.write_bytes(b"previous barcode")
+
+    completed_process = _run_cinebar(
+        [
+            str(media_path),
+            "--output",
+            str(output_path),
+            "--height",
+            "3",
+            "--workers",
+            "1",
+            "--crop",
+            "none",
+            "--overwrite",
+        ]
+    )
+
+    assert completed_process.returncode == 0, completed_process.stderr
+    assert _read_barcode(output_path) == (4, 3, RGB_COLORS)

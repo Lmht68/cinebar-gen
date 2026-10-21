@@ -1,7 +1,6 @@
 """Stream compact frame colors into lossless barcode PNGs."""
 
 from collections.abc import Iterator
-from pathlib import Path
 from typing import BinaryIO, Protocol, cast
 
 import png
@@ -16,7 +15,7 @@ class _ReadableInto(Protocol):
 
 
 def write_barcode_png(
-    output_path: Path,
+    output_file: BinaryIO,
     color_spool: BinaryIO,
     frame_count: int,
     height: int,
@@ -24,14 +23,14 @@ def write_barcode_png(
     """Write a lossless barcode PNG from compact ordered frame colors.
 
     Args:
-        output_path: Final path for the PNG.
+        output_file: Open binary stream that receives the complete PNG.
         color_spool: Seekable binary stream containing three RGB bytes per frame.
         frame_count: Number of frame colors in ``color_spool`` and PNG width.
         height: Requested PNG height in pixels.
 
     Raises:
         ValueError: If dimensions are non-positive or the spool is incomplete.
-        OSError: If the output file cannot be written.
+        OSError: If the output stream cannot be written.
     """
     if frame_count <= 0:
         raise ValueError("frame_count must be positive.")
@@ -45,8 +44,7 @@ def write_barcode_png(
         alpha=False,
         bitdepth=8,
     )
-    with output_path.open("wb") as output_file:
-        writer.write(output_file, _barcode_rows(color_spool, frame_count, height))
+    writer.write(output_file, _barcode_rows(color_spool, frame_count, height))
 
 
 def _barcode_rows(
