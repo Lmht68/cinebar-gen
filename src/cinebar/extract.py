@@ -1,5 +1,6 @@
 """Extract ordered frame colors from OpenCV-decoded video frames."""
 
+import random
 from dataclasses import dataclass
 from hashlib import sha256
 from math import isfinite
@@ -12,7 +13,12 @@ import cv2
 import numpy as np
 from numpy.typing import NDArray
 
-from .crop import CropRectangle, apply_explicit_crop
+from .crop import (
+    AUTOMATIC_CROP_SAMPLE_COUNT,
+    CropRectangle,
+    apply_crop,
+    select_sampled_crop,
+)
 from .errors import CinebarError, FailureCategory
 
 MAX_AUTO_WORKERS = 16
@@ -78,6 +84,48 @@ def partition_frame_ranges(frame_count: int, workers: int) -> list[FrameRange]:
     return frame_ranges
 
 
+def sample_automatic_crop(video_path: Path) -> CropRectangle | None:
+    """Select a crop from twelve random decoded frame positions when possible.
+
+    Args:
+        video_path: Local media file to sample.
+
+    Returns:
+        One fixed picture-region rectangle, or ``None`` when sampling cannot
+        provide unambiguous crop evidence.
+    """
+    try:
+        capture = cv2.VideoCapture(str(video_path))
+        try:
+            if not capture.isOpened():
+                return None
+            frame_count = _usable_frame_count(capture.get(cv2.CAP_PROP_FRAME_COUNT))
+            if frame_count is None or frame_count < AUTOMATIC_CROP_SAMPLE_COUNT:
+                return None
+
+            sampled_positions = sorted(
+                random.sample(
+                    range(frame_count),
+                    k=AUTOMATIC_CROP_SAMPLE_COUNT,
+                )
+            )
+            sampled_frames: list[NDArray[np.uint8]] = []
+            for sampled_position in sampled_positions:
+                if not capture.set(cv2.CAP_PROP_POS_FRAMES, float(sampled_position)):
+                    return None
+                _require_next_frame_position(capture, sampled_position)
+                success, decoded_frame = capture.read()
+                if not success:
+                    return None
+                sampled_frames.append(_validate_decoded_frame(decoded_frame))
+                _require_next_frame_position(capture, sampled_position + 1)
+            return select_sampled_crop(sampled_frames)
+        finally:
+            capture.release()
+    except (CinebarError, cv2.error):
+        return None
+
+
 def extract_frame_colors(
     video_path: Path,
     workers: int | None = None,
@@ -118,14 +166,9 @@ def extract_frame_colors(
     except cv2.error:
         raise CinebarError(FailureCategory.DECODE_FAILED) from None
 
-    if (
-        not isfinite(reported_frame_count)
-        or reported_frame_count <= 0
-        or not reported_frame_count.is_integer()
-    ):
+    frame_count = _usable_frame_count(reported_frame_count)
+    if frame_count is None:
         raise CinebarError(FailureCategory.DECODE_FAILED)
-
-    frame_count = int(reported_frame_count)
     frame_ranges = partition_frame_ranges(frame_count, resolved_workers)
     tasks = [
         (video_path_text, frame_range, frame_count, crop)
@@ -163,7 +206,7 @@ def _extract_frame_colors_sequentially(
                     break
                 bgr_frame = _validate_decoded_frame(decoded_frame)
                 picture_region = (
-                    bgr_frame if crop is None else apply_explicit_crop(bgr_frame, crop)
+                    bgr_frame if crop is None else apply_crop(bgr_frame, crop)
                 )
                 colors.extend(opencv_mean_frame_color(picture_region))
         finally:
@@ -225,7 +268,7 @@ def extract_frame_range(
                 if expected_index == frame_range.start:
                     first_frame_digest = sha256(bgr_frame).digest()
                 picture_region = (
-                    bgr_frame if crop is None else apply_explicit_crop(bgr_frame, crop)
+                    bgr_frame if crop is None else apply_crop(bgr_frame, crop)
                 )
                 colors[color_offset : color_offset + 3] = opencv_mean_frame_color(
                     picture_region
@@ -329,6 +372,17 @@ def _validate_decoded_frame(decoded_frame: object) -> NDArray[np.uint8]:
     ):
         raise CinebarError(FailureCategory.CORRUPT_FRAME)
     return cast(NDArray[np.uint8], decoded_frame)
+
+
+def _usable_frame_count(reported_frame_count: float) -> int | None:
+    """Return one finite, positive integer OpenCV frame count when available."""
+    if (
+        not isfinite(reported_frame_count)
+        or reported_frame_count <= 0
+        or not reported_frame_count.is_integer()
+    ):
+        return None
+    return int(reported_frame_count)
 
 
 def _require_next_frame_position(

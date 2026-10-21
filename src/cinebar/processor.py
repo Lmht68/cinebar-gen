@@ -9,13 +9,15 @@ from typing import BinaryIO, cast
 
 import png
 
-from .crop import CropRectangle
+from .crop import CropMode, CropRectangle, CropSelection
 from .errors import CinebarError, FailureCategory
-from .extract import extract_frame_colors
+from .extract import extract_frame_colors, sample_automatic_crop
 from .models import ProcessingResult
 from .png import write_barcode_png
 
 FrameColorExtractor = Callable[[Path, int | None, CropRectangle | None], bytes]
+
+AutomaticCropSelector = Callable[[Path], CropRectangle | None]
 
 
 class SingleFileProcessor:
@@ -24,13 +26,16 @@ class SingleFileProcessor:
     def __init__(
         self,
         frame_color_extractor: FrameColorExtractor = extract_frame_colors,
+        automatic_crop_selector: AutomaticCropSelector = sample_automatic_crop,
     ) -> None:
-        """Create a processor with an injectable frame-color extraction seam.
+        """Create a processor with injectable extraction and crop-selection seams.
 
         Args:
             frame_color_extractor: Extractor returning three RGB bytes per frame.
+            automatic_crop_selector: Selector returning one sampled crop or no crop.
         """
         self._frame_color_extractor = frame_color_extractor
+        self._automatic_crop_selector = automatic_crop_selector
 
     def process(
         self,
@@ -39,7 +44,7 @@ class SingleFileProcessor:
         height: int = 300,
         workers: int | None = None,
         overwrite: bool = False,
-        crop: CropRectangle | None = None,
+        crop: CropSelection = CropMode.AUTO,
     ) -> ProcessingResult:
         """Decode one media file and atomically publish its complete barcode.
 
@@ -49,7 +54,7 @@ class SingleFileProcessor:
             height: Requested barcode height in pixels.
             workers: Process count, or ``None`` for a safe automatic count.
             overwrite: Whether an existing final PNG may be replaced.
-            crop: Optional fixed picture region to validate and select per frame.
+            crop: Automatic, disabled, or fixed picture-region crop selection.
 
         Returns:
             Dimensions and path of the completed barcode PNG.
@@ -67,14 +72,25 @@ class SingleFileProcessor:
                 or workers <= 0
             ):
                 raise CinebarError(FailureCategory.INVALID_ARGUMENT)
-            if crop is not None and not isinstance(crop, CropRectangle):
+            if not isinstance(crop, (CropMode, CropRectangle)):
                 raise CinebarError(FailureCategory.INVALID_CROP)
 
             if not overwrite:
                 _ensure_output_path_is_available(output_path)
             _validate_input_media(media_path)
 
-            compact_colors = self._frame_color_extractor(media_path, workers, crop)
+            if crop is CropMode.AUTO:
+                resolved_crop = self._automatic_crop_selector(media_path)
+            elif crop is CropMode.NONE:
+                resolved_crop = None
+            else:
+                resolved_crop = crop
+
+            compact_colors = self._frame_color_extractor(
+                media_path,
+                workers,
+                resolved_crop,
+            )
             if not compact_colors:
                 raise CinebarError(FailureCategory.ZERO_FRAMES)
             if len(compact_colors) % 3 != 0:

@@ -7,7 +7,7 @@ from multiprocessing import freeze_support
 from pathlib import Path
 from typing import NoReturn
 
-from .crop import CropRectangle
+from .crop import CropMode, CropRectangle, CropSelection
 from .errors import CinebarError, FailureCategory
 from .processor import SingleFileProcessor
 
@@ -57,11 +57,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--crop",
         type=_crop_selection,
-        default=None,
-        metavar="none|LEFT,TOP,RIGHT,BOTTOM",
+        default=CropMode.AUTO,
+        metavar="auto|none|LEFT,TOP,RIGHT,BOTTOM",
         help=(
-            "Picture region: none or LEFT,TOP,RIGHT,BOTTOM with inclusive left/top "
-            "and exclusive right/bottom."
+            "Picture region: auto, none, or LEFT,TOP,RIGHT,BOTTOM with inclusive "
+            "left/top and exclusive right/bottom."
         ),
     )
     parser.add_argument(
@@ -132,20 +132,22 @@ def _positive_worker_count(value: str) -> int:
     return parsed_value
 
 
-def _crop_selection(value: str) -> CropRectangle | None:
-    """Parse one supported fixed explicit crop selection.
+def _crop_selection(value: str) -> CropSelection:
+    """Parse one automatic, disabled, or fixed crop selection.
 
     Args:
-        value: Raw ``none`` token or four comma-separated decimal coordinates.
+        value: Raw mode token or four comma-separated decimal coordinates.
 
     Returns:
-        ``None`` for ``none`` or one validated explicit crop rectangle.
+        One automatic or disabled mode, or a validated explicit crop rectangle.
 
     Raises:
         CinebarError: If the selection is malformed or has invalid bounds.
     """
+    if value == "auto":
+        return CropMode.AUTO
     if value == "none":
-        return None
+        return CropMode.NONE
 
     coordinate_texts = value.split(",")
     if len(coordinate_texts) != 4:

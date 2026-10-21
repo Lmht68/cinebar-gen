@@ -1,5 +1,6 @@
 """Tests for parallel frame-color extraction helpers."""
 
+import random
 from collections.abc import Callable
 from hashlib import sha256
 from pathlib import Path
@@ -22,6 +23,7 @@ from cinebar.extract import (
     extract_frame_range,
     opencv_mean_frame_color,
     partition_frame_ranges,
+    sample_automatic_crop,
 )
 
 
@@ -49,10 +51,19 @@ def test_partition_frame_ranges_covers_each_frame_index_once() -> None:
 class FakeVideoCapture:
     """Minimal seekable OpenCV capture adapter for extraction tests."""
 
-    def __init__(self, frames: list[NDArray[np.uint8]]) -> None:
-        """Store indexed BGR frames."""
+    def __init__(
+        self,
+        frames: list[NDArray[np.uint8]],
+        reported_frame_count: float | None = None,
+    ) -> None:
+        """Store indexed BGR frames and capture-observation history."""
         self.frames = frames
+        self.reported_frame_count = (
+            float(len(frames)) if reported_frame_count is None else reported_frame_count
+        )
         self.position = 0
+        self.seek_history: list[int] = []
+        self.read_history: list[int] = []
         self.released = False
 
     def isOpened(self) -> bool:
@@ -63,17 +74,19 @@ class FakeVideoCapture:
         """Seek to one synthetic frame index."""
         assert property_id == cv2.CAP_PROP_POS_FRAMES
         self.position = int(value)
+        self.seek_history.append(self.position)
         return True
 
     def get(self, property_id: int) -> float:
         """Return capture metadata or the next synthetic frame index."""
         if property_id == cv2.CAP_PROP_FRAME_COUNT:
-            return float(len(self.frames))
+            return self.reported_frame_count
         assert property_id == cv2.CAP_PROP_POS_FRAMES
         return float(self.position)
 
     def read(self) -> tuple[bool, NDArray[np.uint8] | None]:
         """Read the next synthetic frame or report end of input."""
+        self.read_history.append(self.position)
         if self.position >= len(self.frames):
             return False, None
         frame = self.frames[self.position]
@@ -83,6 +96,99 @@ class FakeVideoCapture:
     def release(self) -> None:
         """Record capture release."""
         self.released = True
+
+
+def test_sample_automatic_crop_reads_twelve_selected_frame_positions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Seek and decode only twelve unique randomized positions in ascending order."""
+    frames = []
+    for index in range(16):
+        frame = np.zeros((4, 6, 3), dtype=np.uint8)
+        frame[1:3] = (index + 20, index + 30, index + 40)
+        frames.append(frame)
+    capture = FakeVideoCapture(frames)
+    selected_positions = [12, 1, 15, 3, 8, 5, 13, 2, 10, 7, 14, 4]
+
+    def choose_positions(population: range, k: int) -> list[int]:
+        assert population == range(16)
+        assert k == 12
+        return selected_positions
+
+    monkeypatch.setattr(cv2, "VideoCapture", lambda _: capture)
+    monkeypatch.setattr(random, "sample", choose_positions)
+
+    crop = sample_automatic_crop(Path("movie.mp4"))
+
+    assert crop == CropRectangle(left=0, top=1, right=6, bottom=3)
+    assert capture.seek_history == sorted(selected_positions)
+    assert capture.read_history == sorted(selected_positions)
+    assert capture.released is True
+
+
+@pytest.mark.parametrize(
+    "reported_frame_count",
+    [11.0, 0.0, -1.0, float("nan"), float("inf"), 12.5],
+)
+def test_sample_automatic_crop_rejects_unusable_frame_count_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+    reported_frame_count: float,
+) -> None:
+    """Return no crop without reading when sampling metadata is unusable."""
+    capture = FakeVideoCapture(
+        [np.zeros((4, 6, 3), dtype=np.uint8) for _ in range(12)],
+        reported_frame_count=reported_frame_count,
+    )
+    monkeypatch.setattr(cv2, "VideoCapture", lambda _: capture)
+
+    crop = sample_automatic_crop(Path("movie.mp4"))
+
+    assert crop is None
+    assert capture.seek_history == []
+    assert capture.read_history == []
+    assert capture.released is True
+
+
+def test_sample_automatic_crop_rejects_an_unusable_sampled_position(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Return no crop and release the probe after a corrupt sampled frame."""
+    frames = [np.zeros((4, 6, 3), dtype=np.uint8) for _ in range(12)]
+    frames[5] = np.zeros((0, 6, 3), dtype=np.uint8)
+    capture = FakeVideoCapture(frames)
+    monkeypatch.setattr(cv2, "VideoCapture", lambda _: capture)
+    monkeypatch.setattr(
+        random,
+        "sample",
+        lambda _population, k: list(range(k)),
+    )
+
+    crop = sample_automatic_crop(Path("movie.mp4"))
+
+    assert crop is None
+    assert capture.read_history == [0, 1, 2, 3, 4, 5]
+    assert capture.released is True
+
+
+def test_sample_automatic_crop_rejects_inconsistent_sample_dimensions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Return no crop after all samples expose inconsistent decoded dimensions."""
+    frames = [np.zeros((4, 6, 3), dtype=np.uint8) for _ in range(12)]
+    frames[-1] = np.zeros((5, 6, 3), dtype=np.uint8)
+    capture = FakeVideoCapture(frames)
+    monkeypatch.setattr(cv2, "VideoCapture", lambda _: capture)
+    monkeypatch.setattr(
+        random,
+        "sample",
+        lambda _population, k: list(range(k)),
+    )
+
+    crop = sample_automatic_crop(Path("movie.mp4"))
+
+    assert crop is None
+    assert capture.read_history == list(range(12))
+    assert capture.released is True
 
 
 def test_extract_frame_range_returns_colors_and_boundary_digests(

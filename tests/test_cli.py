@@ -92,6 +92,54 @@ def test_installed_command_applies_explicit_crop(tmp_path: Path) -> None:
     assert _read_barcode(output_path) == (2, 3, [(60, 60, 60), (75, 30, 15)])
 
 
+@pytest.mark.parametrize(
+    "crop_arguments",
+    [[], ["--crop", "auto"]],
+    ids=["default", "explicit-auto"],
+)
+def test_installed_command_applies_automatic_crop(
+    tmp_path: Path,
+    crop_arguments: list[str],
+) -> None:
+    """Crop stable encoded borders for omitted and explicit automatic selection."""
+    media_path = tmp_path / "automatic-crop-fixture.mkv"
+    output_path = tmp_path / "automatic-crop-barcode.png"
+    _write_automatic_crop_fixture(media_path)
+
+    completed_process = _run_cinebar(
+        [
+            str(media_path),
+            "--output",
+            str(output_path),
+            "--height",
+            "3",
+            "--workers",
+            "1",
+            *crop_arguments,
+        ]
+    )
+
+    assert completed_process.returncode == 0, completed_process.stderr
+    assert _read_barcode(output_path) == (
+        12,
+        3,
+        [
+            (60, 30, 15),
+            (75, 60, 45),
+            (15, 75, 135),
+            (191, 96, 48),
+            (90, 150, 60),
+            (33, 66, 99),
+            (3, 6, 9),
+            (120, 90, 30),
+            (165, 15, 105),
+            (24, 48, 72),
+            (67, 112, 157),
+            (180, 150, 120),
+        ],
+    )
+
+
 def _write_lossless_fixture(media_path: Path) -> None:
     """Write a Matroska fixture with lossless bgr0 frames and uneven PTS values."""
     with av.open(str(media_path), mode="w", format="matroska") as container:
@@ -118,6 +166,42 @@ def _write_lossless_fixture(media_path: Path) -> None:
 def _write_explicit_crop_fixture(media_path: Path) -> None:
     """Write lossless frames with a black border and black picture content."""
     picture_colors = [(80, 80, 80), (100, 40, 20)]
+    with av.open(str(media_path), mode="w", format="matroska") as container:
+        stream = container.add_stream("ffv1", rate=24)
+        stream.width = 4
+        stream.height = 4
+        stream.pix_fmt = "bgr0"
+
+        for presentation_timestamp, picture_color in enumerate(picture_colors):
+            rgb_frame = np.zeros((4, 4, 3), dtype=np.uint8)
+            rgb_frame[1:3, 1:3] = picture_color
+            rgb_frame[1, 1] = (0, 0, 0)
+            frame = av.VideoFrame.from_ndarray(rgb_frame, format="rgb24")
+            frame.pts = presentation_timestamp
+            frame.time_base = Fraction(1, 24)
+            for packet in stream.encode(frame):
+                container.mux(packet)
+
+        for packet in stream.encode():
+            container.mux(packet)
+
+
+def _write_automatic_crop_fixture(media_path: Path) -> None:
+    """Write twelve lossless frames with stable encoded borders."""
+    picture_colors = [
+        (80, 40, 20),
+        (100, 80, 60),
+        (20, 100, 180),
+        (255, 128, 64),
+        (120, 200, 80),
+        (44, 88, 132),
+        (4, 8, 12),
+        (160, 120, 40),
+        (220, 20, 140),
+        (32, 64, 96),
+        (90, 150, 210),
+        (240, 200, 160),
+    ]
     with av.open(str(media_path), mode="w", format="matroska") as container:
         stream = container.add_stream("ffv1", rate=24)
         stream.width = 4

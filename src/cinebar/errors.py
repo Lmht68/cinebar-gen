@@ -31,7 +31,7 @@ _FAILURE_MESSAGES: dict[FailureCategory, str] = {
         "define a non-empty rectangle, and fit every decoded frame."
     ),
     FailureCategory.NON_BLACK_CROP_BOUNDARY: (
-        "Every applicable explicit crop boundary must be exact black in every frame. "
+        "Every applicable crop boundary must be exact black in every frame. "
         "Adjust --crop or use --crop none."
     ),
     FailureCategory.INPUT_NOT_FOUND: (
