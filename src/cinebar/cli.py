@@ -7,6 +7,7 @@ from multiprocessing import freeze_support
 from pathlib import Path
 from typing import NoReturn
 
+from .console import ConsoleProgressRenderer
 from .crop import CropMode, CropRectangle, CropSelection
 from .errors import CinebarError, FailureCategory
 from .processor import SingleFileProcessor
@@ -70,8 +71,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="Replace an existing final PNG after complete encoding.",
     )
 
+    renderer: ConsoleProgressRenderer | None = None
     try:
         arguments = parser.parse_args(argv)
+        renderer = ConsoleProgressRenderer()
         SingleFileProcessor().process(
             media_path=arguments.media_path,
             output_path=arguments.output,
@@ -79,11 +82,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             workers=arguments.workers,
             overwrite=arguments.overwrite,
             crop=arguments.crop,
+            progress_reporter=renderer,
         )
     except CinebarError as error:
+        if renderer is not None:
+            renderer.finish_line()
         LOGGER.error("[%s] %s", error.category.value, error)
         return 130 if error.category is FailureCategory.INTERRUPTED else 1
     except KeyboardInterrupt:
+        if renderer is not None:
+            renderer.finish_line()
         interruption = CinebarError(FailureCategory.INTERRUPTED)
         LOGGER.error("[%s] %s", interruption.category.value, interruption)
         return 130

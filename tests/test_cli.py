@@ -34,7 +34,7 @@ def _assert_installed_failure(
 ) -> None:
     """Require one safe, actionable installed-command failure."""
     assert completed_process.returncode != 0
-    assert completed_process.stderr == f"ERROR [{category}] {message}\n"
+    assert completed_process.stderr.endswith(f"ERROR [{category}] {message}\n")
     assert str(sensitive_media_path) not in completed_process.stderr
 
 
@@ -66,6 +66,10 @@ def test_installed_command_processes_all_variable_timestamp_frames(
 
     assert completed_process.returncode == 0, completed_process.stderr
     assert _read_barcode(output_path) == (4, 3, RGB_COLORS)
+    assert "Decoding frames" in completed_process.stderr
+    assert "1 worker" in completed_process.stderr
+    assert "Encoding PNG" in completed_process.stderr
+    assert "Complete: 4 frames, 4x3" in completed_process.stderr
 
 
 def test_installed_command_applies_explicit_crop(tmp_path: Path) -> None:
@@ -138,6 +142,33 @@ def test_installed_command_applies_automatic_crop(
             (180, 150, 120),
         ],
     )
+    assert "Analyzing crop" in completed_process.stderr
+    assert "12/12 samples" in completed_process.stderr
+
+
+def test_installed_command_reports_actual_multiworker_count(tmp_path: Path) -> None:
+    """Report only the active worker count from a real installed command."""
+    media_path = tmp_path / "multiworker-fixture.mkv"
+    output_path = tmp_path / "multiworker-barcode.png"
+    _write_automatic_crop_fixture(media_path)
+
+    completed_process = _run_cinebar(
+        [
+            str(media_path),
+            "--output",
+            str(output_path),
+            "--height",
+            "3",
+            "--workers",
+            "2",
+            "--crop",
+            "none",
+        ]
+    )
+
+    assert completed_process.returncode == 0, completed_process.stderr
+    assert _read_barcode(output_path)[:2] == (12, 3)
+    assert "2 workers" in completed_process.stderr
 
 
 def _write_lossless_fixture(media_path: Path) -> None:

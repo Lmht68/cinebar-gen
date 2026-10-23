@@ -4,6 +4,15 @@ from .crop import CropMode, CropRectangle, CropSelection
 from .errors import CinebarError, FailureCategory
 from .models import ProcessingResult
 from .processor import SingleFileProcessor
+from .progress import (
+    PhaseProgress,
+    ProcessingCompleted,
+    ProgressEvent,
+    ProgressPhase,
+    ProgressReporter,
+    ProgressState,
+    ProgressUnit,
+)
 
 __all__ = [
     "CinebarError",
@@ -11,6 +20,13 @@ __all__ = [
     "CropRectangle",
     "CropSelection",
     "FailureCategory",
+    "PhaseProgress",
+    "ProcessingCompleted",
     "ProcessingResult",
+    "ProgressEvent",
+    "ProgressPhase",
+    "ProgressReporter",
+    "ProgressState",
+    "ProgressUnit",
     "SingleFileProcessor",
 ]

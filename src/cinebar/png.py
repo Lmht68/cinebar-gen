@@ -5,6 +5,8 @@ from typing import BinaryIO, Protocol, cast
 
 import png
 
+from .progress import UnitProgressCallback
+
 
 class _ReadableInto(Protocol):
     """Read binary data directly into a caller-provided buffer."""
@@ -19,6 +21,8 @@ def write_barcode_png(
     color_spool: BinaryIO,
     frame_count: int,
     height: int,
+    *,
+    progress_callback: UnitProgressCallback | None = None,
 ) -> None:
     """Write a lossless barcode PNG from compact ordered frame colors.
 
@@ -27,6 +31,7 @@ def write_barcode_png(
         color_spool: Seekable binary stream containing three RGB bytes per frame.
         frame_count: Number of frame colors in ``color_spool`` and PNG width.
         height: Requested PNG height in pixels.
+        progress_callback: Recipient of each row consumed by the PNG writer.
 
     Raises:
         ValueError: If dimensions are non-positive or the spool is incomplete.
@@ -44,16 +49,30 @@ def write_barcode_png(
         alpha=False,
         bitdepth=8,
     )
-    writer.write(output_file, _barcode_rows(color_spool, frame_count, height))
+    writer.write(
+        output_file,
+        _barcode_rows(
+            color_spool,
+            frame_count,
+            height,
+            progress_callback=progress_callback,
+        ),
+    )
 
 
 def _barcode_rows(
-    color_spool: BinaryIO, frame_count: int, height: int
+    color_spool: BinaryIO,
+    frame_count: int,
+    height: int,
+    *,
+    progress_callback: UnitProgressCallback | None,
 ) -> Iterator[bytearray]:
     """Yield each barcode row from one reusable compact color buffer."""
     row = bytearray(frame_count * 3)
     color_spool.seek(0)
     if cast(_ReadableInto, color_spool).readinto(row) != len(row):
         raise ValueError("Frame color spool does not contain every decoded frame.")
-    for _ in range(height):
+    for row_count in range(1, height + 1):
         yield row
+        if progress_callback is not None:
+            progress_callback(row_count)

@@ -1,6 +1,7 @@
 """Behavior tests for complete barcode processing."""
 
 import pickle
+from collections.abc import Callable
 from pathlib import Path
 from typing import BinaryIO, cast
 
@@ -9,8 +10,20 @@ import numpy as np
 import png
 import pytest
 
-from cinebar import CinebarError, CropMode, CropRectangle, FailureCategory
+from cinebar import (
+    CinebarError,
+    CropMode,
+    CropRectangle,
+    FailureCategory,
+    PhaseProgress,
+    ProcessingCompleted,
+    ProgressPhase,
+    ProgressState,
+    ProgressUnit,
+)
+from cinebar.extract import FrameExtractionProgress
 from cinebar.processor import SingleFileProcessor
+from cinebar.progress import ProgressTracker
 
 
 @pytest.mark.parametrize(
@@ -145,7 +158,9 @@ def test_process_defaults_to_one_automatic_crop_selection(
     selector_calls: list[Path] = []
     extractor_calls: list[tuple[Path, int | None, CropRectangle | None]] = []
 
-    def select_crop(media: Path) -> CropRectangle:
+    def select_crop(
+        media: Path, *, progress_callback: Callable[[int], None] | None
+    ) -> CropRectangle:
         selector_calls.append(media)
         return selected_crop
 
@@ -153,6 +168,8 @@ def test_process_defaults_to_one_automatic_crop_selection(
         media: Path,
         worker_count: int | None,
         crop: CropRectangle | None,
+        *,
+        progress_callback: Callable[[FrameExtractionProgress], None] | None,
     ) -> bytes:
         extractor_calls.append((media, worker_count, crop))
         return bytes((1, 2, 3))
@@ -188,7 +205,9 @@ def test_process_skips_sampling_for_disabled_or_explicit_crop(
     selector_calls: list[Path] = []
     extractor_calls: list[CropRectangle | None] = []
 
-    def select_crop(media: Path) -> None:
+    def select_crop(
+        media: Path, *, progress_callback: Callable[[int], None] | None
+    ) -> None:
         selector_calls.append(media)
         return None
 
@@ -196,6 +215,8 @@ def test_process_skips_sampling_for_disabled_or_explicit_crop(
         _: Path,
         __: int | None,
         crop: CropRectangle | None,
+        *,
+        progress_callback: Callable[[FrameExtractionProgress], None] | None,
     ) -> bytes:
         extractor_calls.append(crop)
         return bytes((1, 2, 3))
@@ -225,7 +246,9 @@ def test_process_rejects_later_automatic_crop_boundary_before_output(
 
     with pytest.raises(CinebarError) as raised_error:
         SingleFileProcessor(
-            automatic_crop_selector=lambda _: CropRectangle(1, 1, 3, 3)
+            automatic_crop_selector=lambda _, *, progress_callback: CropRectangle(
+                1, 1, 3, 3
+            )
         ).process(media_path, output_path, workers=1)
 
     assert raised_error.value.category is FailureCategory.NON_BLACK_CROP_BOUNDARY
@@ -462,6 +485,8 @@ def test_process_rejects_runtime_crop_value_before_media_access(
         _: Path,
         __: int | None,
         ___: CropRectangle | None,
+        *,
+        progress_callback: Callable[[FrameExtractionProgress], None] | None,
     ) -> bytes:
         nonlocal color_extractor_called
         color_extractor_called = True
@@ -489,6 +514,8 @@ def test_process_rejects_non_positive_height_before_media_access(
         _: Path,
         __: int | None,
         ___: CropRectangle | None,
+        *,
+        progress_callback: Callable[[FrameExtractionProgress], None] | None,
     ) -> bytes:
         nonlocal color_extractor_called
         color_extractor_called = True
@@ -516,6 +543,8 @@ def test_process_rejects_non_positive_worker_count_before_media_access(
         _: Path,
         __: int | None,
         ___: CropRectangle | None,
+        *,
+        progress_callback: Callable[[FrameExtractionProgress], None] | None,
     ) -> bytes:
         nonlocal color_extractor_called
         color_extractor_called = True
@@ -544,6 +573,8 @@ def test_process_refuses_existing_output_before_decoding(tmp_path: Path) -> None
         _: Path,
         __: int | None,
         ___: CropRectangle | None,
+        *,
+        progress_callback: Callable[[FrameExtractionProgress], None] | None,
     ) -> bytes:
         nonlocal color_extractor_called
         color_extractor_called = True
@@ -566,6 +597,8 @@ def test_process_rejects_missing_input_before_decoding(tmp_path: Path) -> None:
         _: Path,
         __: int | None,
         ___: CropRectangle | None,
+        *,
+        progress_callback: Callable[[FrameExtractionProgress], None] | None,
     ) -> bytes:
         nonlocal color_extractor_called
         color_extractor_called = True
@@ -590,6 +623,8 @@ def test_process_rejects_non_regular_input_before_decoding(tmp_path: Path) -> No
         _: Path,
         __: int | None,
         ___: CropRectangle | None,
+        *,
+        progress_callback: Callable[[FrameExtractionProgress], None] | None,
     ) -> bytes:
         nonlocal color_extractor_called
         color_extractor_called = True
@@ -629,6 +664,8 @@ def test_process_writes_ordered_colors_with_black_frame(tmp_path: Path) -> None:
         _: Path,
         __: int | None,
         ___: CropRectangle | None,
+        *,
+        progress_callback: Callable[[FrameExtractionProgress], None] | None,
     ) -> bytes:
         return compact_colors
 
@@ -680,7 +717,9 @@ def test_process_defaults_to_300_pixel_height(tmp_path: Path) -> None:
     output_path = tmp_path / "default-height.png"
     media_path.write_bytes(b"placeholder")
 
-    result = SingleFileProcessor(lambda _path, _workers, _crop: compact_colors).process(
+    result = SingleFileProcessor(
+        lambda _path, _workers, _crop, *, progress_callback: compact_colors
+    ).process(
         media_path,
         output_path,
         crop=CropMode.NONE,
@@ -703,7 +742,9 @@ def test_process_rejects_empty_decode_before_creating_output(tmp_path: Path) -> 
     media_path.write_bytes(b"placeholder")
 
     with pytest.raises(CinebarError) as raised_error:
-        SingleFileProcessor(lambda _path, _workers, _crop: b"").process(
+        SingleFileProcessor(
+            lambda _path, _workers, _crop, *, progress_callback: b""
+        ).process(
             media_path,
             output_path,
             crop=CropMode.NONE,
@@ -723,7 +764,9 @@ def test_process_rejects_incomplete_frame_colors_before_creating_output(
     media_path.write_bytes(b"placeholder")
 
     with pytest.raises(CinebarError) as raised_error:
-        SingleFileProcessor(lambda _path, _workers, _crop: bytes((1, 2))).process(
+        SingleFileProcessor(
+            lambda _path, _workers, _crop, *, progress_callback: bytes((1, 2))
+        ).process(
             media_path,
             output_path,
             crop=CropMode.NONE,
@@ -742,7 +785,9 @@ def test_process_overwrite_replaces_output_with_complete_png(tmp_path: Path) -> 
     output_path.write_bytes(b"previous barcode")
     compact_colors = bytes((10, 20, 30, 40, 50, 60))
 
-    SingleFileProcessor(lambda _path, _workers, _crop: compact_colors).process(
+    SingleFileProcessor(
+        lambda _path, _workers, _crop, *, progress_callback: compact_colors
+    ).process(
         media_path,
         output_path,
         height=2,
@@ -782,7 +827,9 @@ def test_process_encodes_open_destination_temporary_before_replacement(
 
     monkeypatch.setattr(png.Writer, "write", observe_write)
 
-    SingleFileProcessor(lambda _path, _workers, _crop: bytes((1, 2, 3))).process(
+    SingleFileProcessor(
+        lambda _path, _workers, _crop, *, progress_callback: bytes((1, 2, 3))
+    ).process(
         media_path,
         output_path,
         overwrite=True,
@@ -809,7 +856,9 @@ def test_process_removes_temporary_after_partial_write_failure(
     monkeypatch.setattr(png.Writer, "write", raise_partial_write)
 
     with pytest.raises(CinebarError) as raised_error:
-        SingleFileProcessor(lambda _path, _workers, _crop: bytes((1, 2, 3))).process(
+        SingleFileProcessor(
+            lambda _path, _workers, _crop, *, progress_callback: bytes((1, 2, 3))
+        ).process(
             media_path,
             output_path,
             overwrite=True,
@@ -836,7 +885,9 @@ def test_process_removes_temporary_after_interruption(
     monkeypatch.setattr(png.Writer, "write", raise_interruption)
 
     with pytest.raises(CinebarError) as raised_error:
-        SingleFileProcessor(lambda _path, _workers, _crop: bytes((1, 2, 3))).process(
+        SingleFileProcessor(
+            lambda _path, _workers, _crop, *, progress_callback: bytes((1, 2, 3))
+        ).process(
             media_path,
             output_path,
             overwrite=True,
@@ -866,7 +917,9 @@ def test_process_refuses_output_created_while_encoding(
     monkeypatch.setattr(png.Writer, "write", create_competing_output)
 
     with pytest.raises(CinebarError) as raised_error:
-        SingleFileProcessor(lambda _path, _workers, _crop: bytes((1, 2, 3))).process(
+        SingleFileProcessor(
+            lambda _path, _workers, _crop, *, progress_callback: bytes((1, 2, 3))
+        ).process(
             media_path,
             output_path,
             crop=CropMode.NONE,
@@ -887,6 +940,8 @@ def test_process_classifies_interruption_during_decoding(tmp_path: Path) -> None
         _: Path,
         __: int | None,
         ___: CropRectangle | None,
+        *,
+        progress_callback: Callable[[FrameExtractionProgress], None] | None,
     ) -> bytes:
         raise KeyboardInterrupt
 
@@ -900,3 +955,249 @@ def test_process_classifies_interruption_during_decoding(tmp_path: Path) -> None
     assert raised_error.value.category is FailureCategory.INTERRUPTED
     assert not output_path.exists()
     assert not list(tmp_path.glob(f".{output_path.name}.*.tmp"))
+
+
+def test_progress_tracker_emits_throttled_phase_facts_with_rate_and_eta() -> None:
+    """Emit truthful phase snapshots and an unconditional completion."""
+    now = 0.0
+    events: list[PhaseProgress] = []
+    tracker = ProgressTracker(events.append, clock=lambda: now)
+
+    tracker.start(
+        ProgressPhase.CROP_ANALYSIS,
+        ProgressUnit.SAMPLES,
+        total_units=12,
+    )
+    now = 0.05
+    tracker.update(3)
+    now = 1.0
+    tracker.update(6, fraction_complete=0.5, estimate_eta=True)
+    now = 2.0
+    tracker.complete(12)
+
+    assert events == [
+        PhaseProgress(
+            phase=ProgressPhase.CROP_ANALYSIS,
+            state=ProgressState.STARTED,
+            completed_units=0,
+            total_units=12,
+            unit=ProgressUnit.SAMPLES,
+            fraction_complete=0.0,
+            is_estimate=False,
+            elapsed_seconds=0.0,
+            rate_per_second=None,
+            eta_seconds=None,
+            worker_count=None,
+        ),
+        PhaseProgress(
+            phase=ProgressPhase.CROP_ANALYSIS,
+            state=ProgressState.RUNNING,
+            completed_units=6,
+            total_units=12,
+            unit=ProgressUnit.SAMPLES,
+            fraction_complete=0.5,
+            is_estimate=False,
+            elapsed_seconds=1.0,
+            rate_per_second=6.0,
+            eta_seconds=1.0,
+            worker_count=None,
+        ),
+        PhaseProgress(
+            phase=ProgressPhase.CROP_ANALYSIS,
+            state=ProgressState.COMPLETED,
+            completed_units=12,
+            total_units=12,
+            unit=ProgressUnit.SAMPLES,
+            fraction_complete=1.0,
+            is_estimate=False,
+            elapsed_seconds=2.0,
+            rate_per_second=6.0,
+            eta_seconds=None,
+            worker_count=None,
+        ),
+    ]
+
+
+def test_process_reports_complete_progress_and_success_summary(tmp_path: Path) -> None:
+    """Publish progress facts without coupling extraction to terminal rendering."""
+    media_path = tmp_path / "source.mkv"
+    output_path = tmp_path / "barcode.png"
+    media_path.write_bytes(b"placeholder")
+    selected_crop = CropRectangle(left=1, top=2, right=7, bottom=8)
+    now = 0.0
+    events: list[PhaseProgress | ProcessingCompleted] = []
+
+    def clock() -> float:
+        nonlocal now
+        now += 0.1
+        return now
+
+    def select_crop(
+        _: Path,
+        *,
+        progress_callback: Callable[[int], None] | None,
+    ) -> CropRectangle:
+        assert progress_callback is not None
+        for sample_count in range(1, 13):
+            progress_callback(sample_count)
+        return selected_crop
+
+    def extract_colors(
+        _: Path,
+        __: int | None,
+        ___: CropRectangle | None,
+        *,
+        progress_callback: Callable[[FrameExtractionProgress], None] | None,
+    ) -> bytes:
+        assert progress_callback is not None
+        progress_callback(
+            FrameExtractionProgress(
+                decoded_frame_count=0,
+                expected_frame_count=None,
+                worker_count=1,
+                presentation_seconds=None,
+                duration_seconds=4.0,
+            )
+        )
+        progress_callback(
+            FrameExtractionProgress(
+                decoded_frame_count=1,
+                expected_frame_count=None,
+                worker_count=1,
+                presentation_seconds=1.0,
+                duration_seconds=4.0,
+            )
+        )
+        progress_callback(
+            FrameExtractionProgress(
+                decoded_frame_count=3,
+                expected_frame_count=None,
+                worker_count=1,
+                presentation_seconds=3.0,
+                duration_seconds=4.0,
+            )
+        )
+        return bytes((1, 2, 3, 4, 5, 6, 7, 8, 9))
+
+    result = SingleFileProcessor(
+        frame_color_extractor=extract_colors,
+        automatic_crop_selector=select_crop,
+        clock=clock,
+    ).process(
+        media_path,
+        output_path,
+        height=2,
+        workers=1,
+        progress_reporter=events.append,
+    )
+
+    phase_events = [event for event in events if isinstance(event, PhaseProgress)]
+    completed_phases = [
+        event.phase for event in phase_events if event.state is ProgressState.COMPLETED
+    ]
+    successful_completion = events[-1]
+
+    assert result.output_width == 3
+    assert completed_phases == [
+        ProgressPhase.CROP_ANALYSIS,
+        ProgressPhase.FRAME_DECODING,
+        ProgressPhase.PNG_ENCODING,
+        ProgressPhase.OUTPUT_PUBLICATION,
+    ]
+    completed_events = {
+        event.phase: event
+        for event in phase_events
+        if event.state is ProgressState.COMPLETED
+    }
+    assert completed_events[ProgressPhase.CROP_ANALYSIS].completed_units == 12
+    assert completed_events[ProgressPhase.CROP_ANALYSIS].total_units == 12
+    assert completed_events[ProgressPhase.FRAME_DECODING].completed_units == 3
+    assert completed_events[ProgressPhase.PNG_ENCODING].completed_units == 2
+    assert completed_events[ProgressPhase.OUTPUT_PUBLICATION].completed_units == 1
+    assert any(
+        event.phase is ProgressPhase.FRAME_DECODING
+        and event.eta_seconds is not None
+        and event.is_estimate
+        for event in phase_events
+    )
+    assert isinstance(successful_completion, ProcessingCompleted)
+    assert successful_completion.result == result
+    assert successful_completion.elapsed_seconds > 0
+    assert successful_completion.average_frames_per_second is not None
+    assert successful_completion.worker_count == 1
+    assert successful_completion.accepted_crop == selected_crop
+
+
+def test_process_omits_decode_eta_without_timestamp_progress(tmp_path: Path) -> None:
+    """Keep sequential decoding indeterminate when timestamp facts are absent."""
+    media_path = tmp_path / "source.mkv"
+    output_path = tmp_path / "barcode.png"
+    media_path.write_bytes(b"placeholder")
+    now = 0.0
+    events: list[PhaseProgress | ProcessingCompleted] = []
+
+    def clock() -> float:
+        nonlocal now
+        now += 0.1
+        return now
+
+    def extract_colors(
+        _: Path,
+        __: int | None,
+        ___: CropRectangle | None,
+        *,
+        progress_callback: Callable[[FrameExtractionProgress], None] | None,
+    ) -> bytes:
+        assert progress_callback is not None
+        progress_callback(
+            FrameExtractionProgress(
+                decoded_frame_count=0,
+                expected_frame_count=None,
+                worker_count=1,
+                presentation_seconds=None,
+                duration_seconds=None,
+            )
+        )
+        progress_callback(
+            FrameExtractionProgress(
+                decoded_frame_count=1,
+                expected_frame_count=None,
+                worker_count=1,
+                presentation_seconds=None,
+                duration_seconds=None,
+            )
+        )
+        return bytes((1, 2, 3))
+
+    SingleFileProcessor(extract_colors, clock=clock).process(
+        media_path,
+        output_path,
+        height=1,
+        crop=CropMode.NONE,
+        progress_reporter=events.append,
+    )
+
+    assert all(
+        event.eta_seconds is None
+        for event in events
+        if isinstance(event, PhaseProgress)
+        and event.phase is ProgressPhase.FRAME_DECODING
+    )
+
+
+def test_phase_progress_rejects_mismatched_phase_units() -> None:
+    """Prevent renderers from receiving semantically impossible phase facts."""
+    with pytest.raises(ValueError, match="unit must match phase"):
+        PhaseProgress(
+            phase=ProgressPhase.CROP_ANALYSIS,
+            state=ProgressState.STARTED,
+            completed_units=0,
+            total_units=12,
+            unit=ProgressUnit.FRAMES,
+            fraction_complete=0.0,
+            is_estimate=False,
+            elapsed_seconds=0.0,
+            rate_per_second=None,
+            eta_seconds=None,
+            worker_count=None,
+        )

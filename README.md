@@ -31,6 +31,16 @@ Set `--workers N` to choose the process count or `--workers 1` to decode sequent
 uv run cinebar movie.mp4 --output movie-barcode.png --workers 8 --crop none
 ```
 
+## Progress reporting
+
+Cinebar writes progress status to stderr by default.
+Interactive terminals redraw an in-place ASCII bar for crop analysis, frame decoding, PNG encoding, and output publication.
+Redirected stderr receives phase starts and completions plus at most one running line every 30 seconds.
+Decode worker totals always describe the actual active worker count.
+Parallel decode totals and percentages are approximate until range and end-of-stream validation succeeds.
+Sequential decode ETA appears only when OpenCV provides finite duration metadata and monotonic in-range presentation timestamps.
+Missing, non-finite, out-of-range, or regressing metadata leaves frame decoding indeterminate and suppresses ETA.
+
 Omit `--crop` or use `--crop auto` to select one conservative automatic picture region.
 Use `--crop none` to include every decoded pixel.
 

@@ -4,6 +4,7 @@ import random
 from collections.abc import Callable
 from hashlib import sha256
 from pathlib import Path
+from queue import Empty
 from types import TracebackType
 from typing import Self
 
@@ -17,6 +18,7 @@ from cinebar import CinebarError, FailureCategory
 from cinebar.crop import CropRectangle
 from cinebar.extract import (
     ExtractedFrameRange,
+    FrameExtractionProgress,
     FrameRange,
     combine_extracted_frame_ranges,
     extract_frame_colors,
@@ -55,11 +57,26 @@ class FakeVideoCapture:
         self,
         frames: list[NDArray[np.uint8]],
         reported_frame_count: float | None = None,
+        fps: float = 30.0,
+        presentation_milliseconds: list[float] | None = None,
     ) -> None:
-        """Store indexed BGR frames and capture-observation history."""
+        """Store indexed frames, metadata, and capture-observation history.
+
+        Args:
+            frames: Ordered BGR frames returned by the synthetic source.
+            reported_frame_count: Metadata count exposed to the extractor.
+            fps: Metadata frame rate exposed to the extractor.
+            presentation_milliseconds: Post-read presentation positions by frame.
+        """
         self.frames = frames
         self.reported_frame_count = (
             float(len(frames)) if reported_frame_count is None else reported_frame_count
+        )
+        self.fps = fps
+        self.presentation_milliseconds = (
+            [1_000.0 * (index + 1) / fps for index in range(len(frames))]
+            if presentation_milliseconds is None
+            else presentation_milliseconds
         )
         self.position = 0
         self.seek_history: list[int] = []
@@ -81,6 +98,12 @@ class FakeVideoCapture:
         """Return capture metadata or the next synthetic frame index."""
         if property_id == cv2.CAP_PROP_FRAME_COUNT:
             return self.reported_frame_count
+        if property_id == cv2.CAP_PROP_FPS:
+            return self.fps
+        if property_id == cv2.CAP_PROP_POS_MSEC:
+            if self.position == 0:
+                return 0.0
+            return self.presentation_milliseconds[self.position - 1]
         assert property_id == cv2.CAP_PROP_POS_FRAMES
         return float(self.position)
 
@@ -108,6 +131,7 @@ def test_sample_automatic_crop_reads_twelve_selected_frame_positions(
         frame[1:3] = (index + 20, index + 30, index + 40)
         frames.append(frame)
     capture = FakeVideoCapture(frames)
+    sampled_unit_counts: list[int] = []
     selected_positions = [12, 1, 15, 3, 8, 5, 13, 2, 10, 7, 14, 4]
 
     def choose_positions(population: range, k: int) -> list[int]:
@@ -118,9 +142,13 @@ def test_sample_automatic_crop_reads_twelve_selected_frame_positions(
     monkeypatch.setattr(cv2, "VideoCapture", lambda _: capture)
     monkeypatch.setattr(random, "sample", choose_positions)
 
-    crop = sample_automatic_crop(Path("movie.mp4"))
+    crop = sample_automatic_crop(
+        Path("movie.mp4"),
+        progress_callback=sampled_unit_counts.append,
+    )
 
     assert crop == CropRectangle(left=0, top=1, right=6, bottom=3)
+    assert sampled_unit_counts == list(range(1, 13))
     assert capture.seek_history == sorted(selected_positions)
     assert capture.read_history == sorted(selected_positions)
     assert capture.released is True
@@ -206,6 +234,8 @@ def test_extract_frame_range_returns_colors_and_boundary_digests(
         "movie.mp4",
         FrameRange(start=1, end=2),
         frame_count=4,
+        crop=None,
+        worker_slot=0,
     )
 
     assert extracted_range.colors == bytes((1, 2, 3, 2, 3, 4))
@@ -242,12 +272,62 @@ def test_combine_extracted_frame_ranges_preserves_order_and_coverage() -> None:
     assert colors == bytes(range(1, 13))
 
 
+class FakeQueue:
+    """In-memory queue exposing the progress transport methods under test."""
+
+    def __init__(self) -> None:
+        """Create an empty synthetic worker-progress queue."""
+        self._items: list[tuple[int, int]] = []
+
+    def put(self, item: tuple[int, int]) -> None:
+        """Append one worker-slot decoded-frame count."""
+        self._items.append(item)
+
+    def get_nowait(self) -> tuple[int, int]:
+        """Return one pending count without blocking."""
+        if not self._items:
+            raise Empty
+        return self._items.pop(0)
+
+    def close(self) -> None:
+        """Match the multiprocessing queue shutdown contract."""
+
+    def join_thread(self) -> None:
+        """Match the multiprocessing queue shutdown contract."""
+
+
+class FakeAsyncResult:
+    """Return inline pool results through the asynchronous-result interface."""
+
+    def __init__(self, extracted_ranges: list[ExtractedFrameRange]) -> None:
+        """Store completed inline worker results."""
+        self._extracted_ranges = extracted_ranges
+
+    def ready(self) -> bool:
+        """Report that inline execution has completed."""
+        return True
+
+    def wait(self, timeout: float | None = None) -> None:
+        """Match the asynchronous-result wait contract."""
+
+    def get(self) -> list[ExtractedFrameRange]:
+        """Return submitted worker results in task order."""
+        return self._extracted_ranges
+
+
 class FakePool:
     """Run process-pool tasks inline while retaining the pool interface."""
 
-    def __init__(self, processes: int) -> None:
-        """Record the requested process count."""
+    def __init__(
+        self,
+        processes: int,
+        initializer: Callable[..., None] | None = None,
+        initargs: tuple[object, ...] = (),
+    ) -> None:
+        """Record the requested process count and initialize synthetic workers."""
         self.processes = processes
+        if initializer is not None:
+            initializer(*initargs)
 
     def __enter__(self) -> Self:
         """Enter the inline pool context."""
@@ -261,16 +341,16 @@ class FakePool:
     ) -> None:
         """Leave the inline pool context."""
 
-    def starmap(
+    def starmap_async(
         self,
         function: Callable[
-            [str, FrameRange, int, CropRectangle | None],
+            [str, FrameRange, int, CropRectangle | None, int],
             ExtractedFrameRange,
         ],
-        tasks: list[tuple[str, FrameRange, int, CropRectangle | None]],
-    ) -> list[ExtractedFrameRange]:
+        tasks: list[tuple[str, FrameRange, int, CropRectangle | None, int]],
+    ) -> FakeAsyncResult:
         """Execute submitted extraction tasks in order."""
-        return [function(*task) for task in tasks]
+        return FakeAsyncResult([function(*task) for task in tasks])
 
 
 def test_extract_frame_colors_validates_and_combines_worker_ranges(
@@ -282,6 +362,7 @@ def test_extract_frame_colors_validates_and_combines_worker_ranges(
         for index in range(4)
     ]
     captures: list[FakeVideoCapture] = []
+    progress_facts: list[FrameExtractionProgress] = []
 
     def create_capture(_: str) -> FakeVideoCapture:
         capture = FakeVideoCapture(frames)
@@ -290,10 +371,20 @@ def test_extract_frame_colors_validates_and_combines_worker_ranges(
 
     monkeypatch.setattr(cv2, "VideoCapture", create_capture)
     monkeypatch.setattr(extract_module, "Pool", FakePool)
+    monkeypatch.setattr(extract_module, "Queue", FakeQueue)
 
-    colors = extract_frame_colors(Path("movie.mp4"), workers=2)
+    colors = extract_frame_colors(
+        Path("movie.mp4"),
+        workers=2,
+        progress_callback=progress_facts.append,
+    )
 
     assert colors == bytes((0, 1, 2, 1, 2, 3, 2, 3, 4, 3, 4, 5))
+    assert progress_facts == [
+        FrameExtractionProgress(0, 4, 2, None, None),
+        FrameExtractionProgress(4, 4, 2, None, None),
+        FrameExtractionProgress(4, 4, 2, None, None),
+    ]
     assert len(captures) == 3
     assert all(capture.released for capture in captures)
 
@@ -359,3 +450,69 @@ def test_combine_extracted_frame_ranges_rejects_boundary_mismatch() -> None:
         )
 
     assert raised_error.value.category is FailureCategory.DECODE_FAILED
+
+
+def test_extract_frame_colors_reports_sequential_timestamp_progress(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Suppress later timestamp fractions after a regressing presentation position."""
+    frames = [
+        np.full((1, 1, 3), (index, index, index), dtype=np.uint8) for index in range(3)
+    ]
+    capture = FakeVideoCapture(
+        frames,
+        reported_frame_count=4.0,
+        fps=4.0,
+        presentation_milliseconds=[250.0, 500.0, 250.0],
+    )
+    progress_facts: list[FrameExtractionProgress] = []
+    monkeypatch.setattr(cv2, "VideoCapture", lambda _: capture)
+
+    colors = extract_frame_colors(
+        Path("movie.mp4"),
+        workers=1,
+        progress_callback=progress_facts.append,
+    )
+
+    assert colors == bytes((0, 0, 0, 1, 1, 1, 2, 2, 2))
+    assert progress_facts == [
+        FrameExtractionProgress(0, None, 1, None, 1.0),
+        FrameExtractionProgress(1, None, 1, 0.25, 1.0),
+        FrameExtractionProgress(2, None, 1, 0.5, 1.0),
+        FrameExtractionProgress(3, None, 1, None, 1.0),
+        FrameExtractionProgress(3, None, 1, None, 1.0),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("fps", "presentation_milliseconds"),
+    [
+        (0.0, [250.0, 500.0, 750.0]),
+        (4.0, [float("nan"), 500.0, 750.0]),
+        (4.0, [1_250.0, 500.0, 750.0]),
+    ],
+    ids=["missing-duration", "non-finite-timestamp", "out-of-range-timestamp"],
+)
+def test_extract_frame_colors_suppresses_untrustworthy_timestamp_progress(
+    monkeypatch: pytest.MonkeyPatch,
+    fps: float,
+    presentation_milliseconds: list[float],
+) -> None:
+    """Never recover a sequential fraction after timestamp prerequisites fail."""
+    frames = [np.zeros((1, 1, 3), dtype=np.uint8) for _ in range(3)]
+    capture = FakeVideoCapture(
+        frames,
+        reported_frame_count=4.0,
+        fps=fps,
+        presentation_milliseconds=presentation_milliseconds,
+    )
+    progress_facts: list[FrameExtractionProgress] = []
+    monkeypatch.setattr(cv2, "VideoCapture", lambda _: capture)
+
+    extract_frame_colors(
+        Path("movie.mp4"),
+        workers=1,
+        progress_callback=progress_facts.append,
+    )
+
+    assert all(fact.presentation_seconds is None for fact in progress_facts)
