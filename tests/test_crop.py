@@ -154,15 +154,20 @@ def test_select_sampled_crop_requires_exactly_twelve_samples() -> None:
     assert select_sampled_crop(sampled_frames) is None
 
 
-def test_select_sampled_crop_requires_an_exact_black_candidate_boundary() -> None:
-    """Reject a near-black but non-exact-black last-excluded candidate line."""
+def test_select_sampled_crop_accepts_near_black_candidate_boundary() -> None:
+    """Accept a near-black last-excluded candidate line."""
     sampled_frames = [
         np.full((6, 8, 3), (30, 40, 50), dtype=np.uint8) for _ in range(12)
     ]
     for sampled_frame in sampled_frames:
         sampled_frame[0] = (16, 16, 16)
 
-    assert select_sampled_crop(sampled_frames) is None
+    assert select_sampled_crop(sampled_frames) == CropRectangle(
+        left=0,
+        top=1,
+        right=8,
+        bottom=6,
+    )
 
 
 def test_apply_crop_returns_picture_region_view() -> None:
@@ -189,16 +194,37 @@ def test_apply_crop_returns_picture_region_view() -> None:
     ]
 
 
+def test_apply_crop_accepts_boundary_at_near_black_coverage_threshold() -> None:
+    """Accept boundaries with exactly 99 near-black pixels out of 100."""
+    bgr_frame = np.full((100, 100, 3), (30, 40, 50), dtype=np.uint8)
+    bgr_frame[0] = (16, 16, 16)
+    bgr_frame[-1] = (16, 16, 16)
+    bgr_frame[:, 0] = (16, 16, 16)
+    bgr_frame[:, -1] = (16, 16, 16)
+    bgr_frame[0, 50] = (17, 0, 0)
+    bgr_frame[-1, 50] = (17, 0, 0)
+    bgr_frame[50, 0] = (17, 0, 0)
+    bgr_frame[50, -1] = (17, 0, 0)
+
+    picture_region = apply_crop(
+        bgr_frame,
+        CropRectangle(left=1, top=1, right=99, bottom=99),
+    )
+
+    assert picture_region.shape == (98, 98, 3)
+    assert np.shares_memory(picture_region, bgr_frame)
+
+
 @pytest.mark.parametrize(
-    "non_black_position",
+    "below_threshold_position",
     [(0, 1), (3, 1), (1, 0), (1, 3)],
 )
-def test_apply_crop_rejects_non_black_boundary(
-    non_black_position: tuple[int, int],
+def test_apply_crop_rejects_boundary_below_near_black_coverage(
+    below_threshold_position: tuple[int, int],
 ) -> None:
-    """Reject a non-black pixel on any applicable last-excluded boundary."""
+    """Reject an applicable boundary below near-black coverage."""
     bgr_frame = np.zeros((4, 4, 3), dtype=np.uint8)
-    bgr_frame[non_black_position] = (1, 0, 0)
+    bgr_frame[below_threshold_position] = (17, 0, 0)
 
     with pytest.raises(CinebarError) as raised_error:
         apply_crop(

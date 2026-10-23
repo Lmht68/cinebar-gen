@@ -54,11 +54,11 @@ It scans contiguous qualifying runs from each outer edge.
 A fully qualifying dimension is ambiguous, while a zero-length run is valid evidence that the edge remains uncropped.
 
 Each edge is evaluated independently.
-An edge is selected only when all sampled frames share dimensions, every informative candidate has the same coordinate, the edge removes at least one line, and its last excluded line is exact decoded RGB `(0, 0, 0)` in every sample.
+An edge is selected only when all sampled frames share dimensions, every informative candidate has the same coordinate, the edge removes at least one line, and its last excluded line satisfies the same near-black criterion: at least `ceil(line_pixel_count * 0.99)` pixels have every decoded channel at or below 16 in every sample.
 The resulting rectangle must be non-empty.
 Otherwise, that edge remains uncropped.
 
-Automatic mode uses no crop when metadata is unusable or below 12, the probe cannot open, seek, validate a position, or decode a usable sample, sample dimensions differ, evidence is ambiguous or contradictory, a candidate boundary is not exact black, no edge is accepted, or the combined rectangle is empty.
+Automatic mode uses no crop when metadata is unusable or below 12, the probe cannot open, seek, validate a position, or decode a usable sample, sample dimensions differ, evidence is ambiguous or contradictory, a candidate boundary falls below the near-black criterion, no edge is accepted, or the combined rectangle is empty.
 
 ```console
 uv run cinebar movie.mp4 --output movie-barcode.png --workers 1 --crop 140,80,1780,1000
@@ -66,10 +66,10 @@ uv run cinebar movie.mp4 --output movie-barcode.png --workers 1 --crop 140,80,17
 
 An explicit crop uses zero-based `LEFT,TOP,RIGHT,BOTTOM` coordinates, with inclusive left and top edges and exclusive right and bottom edges.
 The same non-empty rectangle must fit every decoded frame.
-For automatic and explicit crops, every applicable last excluded row or column must be exact decoded RGB `(0, 0, 0)` in every complete-pass frame.
+For automatic and explicit crops, every applicable last excluded row or column must satisfy the same near-black criterion: at least `ceil(line_pixel_count * 0.99)` pixels have every decoded channel at or below 16 in every complete-pass frame.
 Sides that remove no pixels have no crop boundary to validate.
 Genuine black pixels inside the accepted picture region remain part of the frame-color arithmetic mean.
-Invalid crop bounds or a later non-black crop boundary fails without publishing a final PNG or retaining a destination-side temporary PNG.
+Invalid crop bounds or a later crop boundary below the near-black criterion fails without publishing a final PNG or retaining a destination-side temporary PNG.
 
 After the bounded automatic probe, Cinebar runs exactly one complete worker-backed color pass.
 Each decoded frame contributes one frame strip from the selected picture region.

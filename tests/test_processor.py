@@ -45,8 +45,9 @@ from cinebar.progress import ProgressTracker
         (
             FailureCategory.NON_BLACK_CROP_BOUNDARY,
             (
-                "Every applicable crop boundary must be exact black in every frame. "
-                "Adjust --crop or use --crop none."
+                "Every applicable crop boundary must have at least 99% of pixels with "
+                "every RGB channel at 16 or below in every frame. Adjust --crop or "
+                "use --crop none."
             ),
         ),
         (
@@ -240,7 +241,7 @@ def test_process_rejects_later_automatic_crop_boundary_before_output(
     media_path.write_bytes(b"placeholder")
     first_frame = np.zeros((4, 4, 3), dtype=np.uint8)
     later_frame = np.zeros((4, 4, 3), dtype=np.uint8)
-    later_frame[3, 1] = (1, 0, 0)
+    later_frame[3, 1] = (17, 0, 0)
     capture = _SequentialCapture([(True, first_frame), (True, later_frame)])
     monkeypatch.setattr(cv2, "VideoCapture", lambda _: capture)
 
@@ -446,15 +447,15 @@ def test_process_rejects_crop_out_of_bounds_on_later_frame_before_output(
     assert not list(tmp_path.glob(f".{output_path.name}.*.tmp"))
 
 
-def test_process_rejects_non_black_crop_boundary_before_output(
+def test_process_rejects_crop_boundary_below_near_black_coverage_before_output(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Reject one later non-black pixel on an applicable crop boundary."""
-    media_path = tmp_path / "non-black-boundary.mkv"
-    output_path = tmp_path / "non-black-boundary.png"
+    """Reject an applicable crop boundary below near-black coverage."""
+    media_path = tmp_path / "near-black-boundary.mkv"
+    output_path = tmp_path / "near-black-boundary.png"
     media_path.write_bytes(b"placeholder")
     later_frame = np.zeros((4, 4, 3), dtype=np.uint8)
-    later_frame[3, 1] = (1, 0, 0)
+    later_frame[3, 1] = (17, 0, 0)
     capture = _SequentialCapture(
         [(True, np.zeros((3, 3, 3), dtype=np.uint8)), (True, later_frame)]
     )

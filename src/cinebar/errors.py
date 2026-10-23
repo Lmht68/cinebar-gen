@@ -31,8 +31,8 @@ _FAILURE_MESSAGES: dict[FailureCategory, str] = {
         "define a non-empty rectangle, and fit every decoded frame."
     ),
     FailureCategory.NON_BLACK_CROP_BOUNDARY: (
-        "Every applicable crop boundary must be exact black in every frame. "
-        "Adjust --crop or use --crop none."
+        "Every applicable crop boundary must have at least 99% of pixels with every "
+        "RGB channel at 16 or below in every frame. Adjust --crop or use --crop none."
     ),
     FailureCategory.INPUT_NOT_FOUND: (
         "Input media was not found. Verify the source path and try again."

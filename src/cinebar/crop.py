@@ -15,6 +15,17 @@ NEAR_BLACK_CHANNEL_MAX = 16
 NEAR_BLACK_MIN_COVERAGE = 0.99
 
 
+def _minimum_near_black_pixels(line_pixel_count: int) -> int:
+    return ceil(line_pixel_count * NEAR_BLACK_MIN_COVERAGE)
+
+
+def _line_qualifies_as_near_black(bgr_line: NDArray[np.uint8]) -> bool:
+    near_black_pixels = np.all(bgr_line <= NEAR_BLACK_CHANNEL_MAX, axis=1)
+    return bool(
+        np.count_nonzero(near_black_pixels) >= _minimum_near_black_pixels(len(bgr_line))
+    )
+
+
 class CropMode(StrEnum):
     """Select automatic or disabled picture-region cropping."""
 
@@ -64,8 +75,8 @@ def select_sampled_crop(
 ) -> CropRectangle | None:
     """Select one fixed crop from twelve sampled decoded frames.
 
-    Each accepted edge has a unanimous near-black run length and an exact-black
-    crop boundary in every sample.
+    Each accepted edge has a unanimous near-black run length and near-black
+    crop boundary coverage in every sample.
 
     Args:
         sampled_frames: Twelve validated packed 8-bit BGR frames.
@@ -85,19 +96,20 @@ def select_sampled_crop(
     bottom_candidates: list[int | None] = []
     left_candidates: list[int | None] = []
     right_candidates: list[int | None] = []
-    minimum_black_pixels_per_row = ceil(frame_width * NEAR_BLACK_MIN_COVERAGE)
-    minimum_black_pixels_per_column = ceil(frame_height * NEAR_BLACK_MIN_COVERAGE)
+    minimum_near_black_pixels_per_row = _minimum_near_black_pixels(frame_width)
+    minimum_near_black_pixels_per_column = _minimum_near_black_pixels(frame_height)
     for sampled_frame in sampled_frames:
         near_black_pixels = np.all(
             sampled_frame <= NEAR_BLACK_CHANNEL_MAX,
             axis=2,
         )
         qualifying_rows = (
-            np.count_nonzero(near_black_pixels, axis=1) >= minimum_black_pixels_per_row
+            np.count_nonzero(near_black_pixels, axis=1)
+            >= minimum_near_black_pixels_per_row
         )
         qualifying_columns = (
             np.count_nonzero(near_black_pixels, axis=0)
-            >= minimum_black_pixels_per_column
+            >= minimum_near_black_pixels_per_column
         )
         top_run = _leading_qualifying_run_length(qualifying_rows)
         bottom_run = _trailing_qualifying_run_length(qualifying_rows)
@@ -204,7 +216,7 @@ def _accept_sampled_edge(
             if axis == 0
             else sampled_frame[:, boundary_coordinate]
         )
-        if np.any(boundary):
+        if not _line_qualifies_as_near_black(boundary):
             return None
     return candidate
 
@@ -223,19 +235,28 @@ def apply_crop(
         A view of the accepted picture region.
 
     Raises:
-        CinebarError: If the rectangle does not fit or a boundary is non-black.
+        CinebarError: If the rectangle does not fit or a boundary falls below the
+            near-black criterion.
     """
     frame_height, frame_width = bgr_frame.shape[:2]
     if rectangle.right > frame_width or rectangle.bottom > frame_height:
         raise CinebarError(FailureCategory.INVALID_CROP)
 
-    if rectangle.top > 0 and np.any(bgr_frame[rectangle.top - 1]):
+    if rectangle.top > 0 and not _line_qualifies_as_near_black(
+        bgr_frame[rectangle.top - 1]
+    ):
         raise CinebarError(FailureCategory.NON_BLACK_CROP_BOUNDARY)
-    if rectangle.bottom < frame_height and np.any(bgr_frame[rectangle.bottom]):
+    if rectangle.bottom < frame_height and not _line_qualifies_as_near_black(
+        bgr_frame[rectangle.bottom]
+    ):
         raise CinebarError(FailureCategory.NON_BLACK_CROP_BOUNDARY)
-    if rectangle.left > 0 and np.any(bgr_frame[:, rectangle.left - 1]):
+    if rectangle.left > 0 and not _line_qualifies_as_near_black(
+        bgr_frame[:, rectangle.left - 1]
+    ):
         raise CinebarError(FailureCategory.NON_BLACK_CROP_BOUNDARY)
-    if rectangle.right < frame_width and np.any(bgr_frame[:, rectangle.right]):
+    if rectangle.right < frame_width and not _line_qualifies_as_near_black(
+        bgr_frame[:, rectangle.right]
+    ):
         raise CinebarError(FailureCategory.NON_BLACK_CROP_BOUNDARY)
 
     return bgr_frame[rectangle.top : rectangle.bottom, rectangle.left : rectangle.right]

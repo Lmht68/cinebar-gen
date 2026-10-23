@@ -73,7 +73,7 @@ def test_installed_command_processes_all_variable_timestamp_frames(
 
 
 def test_installed_command_applies_explicit_crop(tmp_path: Path) -> None:
-    """Apply one exact-black explicit picture region to every lossless frame."""
+    """Apply one explicit picture region to every lossless frame."""
     media_path = tmp_path / "explicit-crop-fixture.mkv"
     output_path = tmp_path / "explicit-crop-barcode.png"
     _write_explicit_crop_fixture(media_path)
