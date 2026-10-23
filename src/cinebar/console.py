@@ -97,9 +97,10 @@ class ConsoleProgressRenderer:
         if event.fraction_complete is not None:
             percentage_prefix = "~" if event.is_estimate else ""
             parts.append(f"{percentage_prefix}{event.fraction_complete:.0%}")
-        parts.append(f"elapsed {_format_duration(event.elapsed_seconds)}")
-        if event.rate_per_second is not None:
-            parts.append(f"{event.rate_per_second:.1f} {event.unit.value}/s")
+        if event.phase is not ProgressPhase.OUTPUT_PUBLICATION:
+            parts.append(f"elapsed {_format_duration(event.elapsed_seconds)}")
+            if event.rate_per_second is not None:
+                parts.append(f"{event.rate_per_second:.1f} {event.unit.value}/s")
         if event.worker_count is not None:
             parts.append(_format_workers(event.worker_count))
         if event.eta_seconds is not None:

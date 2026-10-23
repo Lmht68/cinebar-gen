@@ -217,3 +217,28 @@ def test_finish_line_starts_error_output_on_a_clean_line() -> None:
     stream.write("ERROR [decode_failed] safe message\n")
 
     assert stream.getvalue().endswith("\nERROR [decode_failed] safe message\n")
+
+
+def test_renderer_omits_single_file_publication_rate() -> None:
+    """Avoid meaningless throughput for one atomic output publication."""
+    stream = StringIO()
+    renderer = ConsoleProgressRenderer(stream)
+
+    renderer(
+        _phase_progress(
+            phase=ProgressPhase.OUTPUT_PUBLICATION,
+            state=ProgressState.COMPLETED,
+            completed_units=1,
+            total_units=1,
+            unit=ProgressUnit.FILES,
+            fraction_complete=1.0,
+            elapsed_seconds=0.078,
+            rate_per_second=12.8,
+        )
+    )
+
+    rendered = stream.getvalue()
+
+    assert "Publishing output" in rendered
+    assert "elapsed" not in rendered
+    assert "12.8 files/s" not in rendered
