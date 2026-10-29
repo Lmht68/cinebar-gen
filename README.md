@@ -31,6 +31,19 @@ Set `--workers N` to choose the process count or `--workers 1` to decode sequent
 uv run cinebar movie.mp4 --output movie-barcode.png --workers 8 --crop none
 ```
 
+## Generate barcodes in a directory tree
+
+```console
+uv run cinebar batch ROOT
+```
+
+Batch mode recursively scans `ROOT` for case-insensitive `.avi`, `.m2ts`, `.m4v`, `.mkv`, `.mov`, `.mp4`, `.mpeg`, `.mpg`, `.mts`, `.ts`, `.webm`, and `.wmv` sources.
+It skips dot-prefixed and host-hidden entries, symlinks, and Windows reparse points.
+Each movie is generated one at a time, using the normal `--height`, `--workers`, `--crop`, and `--overwrite` options.
+Each barcode is written beside its source as `<stem>.cinebar.png`.
+Source files must already be stable before batch processing starts.
+If distinct source files map to one barcode path, the batch aborts before generating any barcode.
+
 ## Progress reporting
 
 Cinebar writes progress status to stderr by default.

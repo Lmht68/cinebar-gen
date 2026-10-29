@@ -2,6 +2,7 @@
 
 import argparse
 import logging
+import sys
 from collections.abc import Sequence
 from multiprocessing import freeze_support
 from pathlib import Path
@@ -9,6 +10,7 @@ from typing import NoReturn
 
 from .console import ConsoleProgressRenderer
 from .crop import CropMode, CropRectangle, CropSelection
+from .directory import DirectoryProcessor, GenerationSettings
 from .errors import CinebarError, FailureCategory
 from .processor import SingleFileProcessor
 
@@ -27,27 +29,16 @@ class _CinebarArgumentParser(argparse.ArgumentParser):
         raise CinebarError(FailureCategory.INVALID_ARGUMENT)
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    """Generate one complete barcode from a local media file.
-
-    Args:
-        argv: Optional command-line arguments excluding the program name.
-
-    Returns:
-        Zero after publication, one after a failure, or 130 after interruption.
-    """
-    freeze_support()
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
-    parser = _CinebarArgumentParser(
-        description="Generate a complete lossless media barcode."
-    )
-    parser.add_argument("media_path", type=Path, help="Local media file to decode.")
-    parser.add_argument("--output", required=True, type=Path, help="Final PNG path.")
+def _add_generation_options(
+    parser: argparse.ArgumentParser,
+    height_help: str,
+) -> None:
+    """Add generation options shared by single-file and batch commands."""
     parser.add_argument(
         "--height",
         type=_positive_integer,
         default=100,
-        help="Barcode height in pixels. Defaults to 300.",
+        help=height_help,
     )
     parser.add_argument(
         "--workers",
@@ -71,19 +62,92 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="Replace an existing final PNG after complete encoding.",
     )
 
+
+def _build_single_file_parser() -> _CinebarArgumentParser:
+    """Build the compatibility-sensitive legacy single-file parser."""
+    parser = _CinebarArgumentParser(
+        description="Generate a complete lossless media barcode."
+    )
+    parser.add_argument("media_path", type=Path, help="Local media file to decode.")
+    parser.add_argument("--output", required=True, type=Path, help="Final PNG path.")
+    _add_generation_options(
+        parser,
+        height_help="Barcode height in pixels. Defaults to 300.",
+    )
+    return parser
+
+
+def _build_batch_parser() -> _CinebarArgumentParser:
+    """Build the parser for recursive beside-input barcode generation."""
+    parser = _CinebarArgumentParser(
+        description="Generate beside-input barcodes from a stable media directory."
+    )
+    parser.add_argument(
+        "root",
+        type=Path,
+        help="Directory tree containing stable media files to process.",
+    )
+    _add_generation_options(
+        parser,
+        height_help="Barcode height in pixels. Defaults to 100.",
+    )
+    return parser
+
+
+def _is_legacy_output_token(argument: str) -> bool:
+    """Return whether one token is an accepted legacy output option spelling."""
+    option = argument.partition("=")[0]
+    return option.startswith("--ou") and "--output".startswith(option)
+
+
+def _is_batch_command(arguments: Sequence[str]) -> bool:
+    """Return whether argv unambiguously selects the batch command."""
+    return (
+        bool(arguments)
+        and arguments[0] == "batch"
+        and not any(_is_legacy_output_token(argument) for argument in arguments[1:])
+    )
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """Generate barcodes from one media file or a stable directory tree.
+
+    Args:
+        argv: Optional command-line arguments excluding the program name.
+
+    Returns:
+        Zero after publication, one after a failure, or 130 after interruption.
+    """
+    freeze_support()
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    arguments = list(sys.argv[1:] if argv is None else argv)
     renderer: ConsoleProgressRenderer | None = None
     try:
-        arguments = parser.parse_args(argv)
-        renderer = ConsoleProgressRenderer()
-        SingleFileProcessor().process(
-            media_path=arguments.media_path,
-            output_path=arguments.output,
-            height=arguments.height,
-            workers=arguments.workers,
-            overwrite=arguments.overwrite,
-            crop=arguments.crop,
-            progress_reporter=renderer,
-        )
+        if _is_batch_command(arguments):
+            batch_arguments = _build_batch_parser().parse_args(arguments[1:])
+            renderer = ConsoleProgressRenderer()
+            DirectoryProcessor().process_batch(
+                root=batch_arguments.root,
+                settings=GenerationSettings(
+                    height=batch_arguments.height,
+                    workers=batch_arguments.workers,
+                    crop=batch_arguments.crop,
+                    overwrite=batch_arguments.overwrite,
+                ),
+                progress_reporter=renderer,
+            )
+        else:
+            single_file_arguments = _build_single_file_parser().parse_args(arguments)
+            renderer = ConsoleProgressRenderer()
+            SingleFileProcessor().process(
+                media_path=single_file_arguments.media_path,
+                output_path=single_file_arguments.output,
+                height=single_file_arguments.height,
+                workers=single_file_arguments.workers,
+                overwrite=single_file_arguments.overwrite,
+                crop=single_file_arguments.crop,
+                progress_reporter=renderer,
+            )
     except CinebarError as error:
         if renderer is not None:
             renderer.finish_line()

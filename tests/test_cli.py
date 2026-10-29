@@ -14,7 +14,10 @@ RGB_COLORS = [(40, 50, 60), (0, 0, 0), (200, 80, 20), (9, 150, 230)]
 PRESENTATION_TIMESTAMPS = [0, 1, 4, 10]
 
 
-def _run_cinebar(arguments: list[str]) -> subprocess.CompletedProcess[str]:
+def _run_cinebar(
+    arguments: list[str],
+    working_directory: Path | None = None,
+) -> subprocess.CompletedProcess[str]:
     """Run the installed Cinebar command with captured text output."""
     cinebar_executable = shutil.which("cinebar")
     assert cinebar_executable is not None, "Installed cinebar executable was not found."
@@ -22,6 +25,7 @@ def _run_cinebar(arguments: list[str]) -> subprocess.CompletedProcess[str]:
         [cinebar_executable, *arguments],
         check=False,
         capture_output=True,
+        cwd=working_directory,
         text=True,
     )
 
@@ -169,6 +173,70 @@ def test_installed_command_reports_actual_multiworker_count(tmp_path: Path) -> N
     assert completed_process.returncode == 0, completed_process.stderr
     assert _read_barcode(output_path)[:2] == (12, 3)
     assert "2 workers" in completed_process.stderr
+
+
+def test_installed_command_preserves_relative_source_named_batch(
+    tmp_path: Path,
+) -> None:
+    """Keep legacy processing when the relative source path is literally batch."""
+    media_path = tmp_path / "batch"
+    output_path = tmp_path / "barcode.png"
+    _write_lossless_fixture(media_path)
+
+    completed_process = _run_cinebar(
+        [
+            "batch",
+            "--output",
+            "barcode.png",
+            "--height",
+            "3",
+            "--workers",
+            "1",
+            "--crop",
+            "none",
+        ],
+        working_directory=tmp_path,
+    )
+
+    assert completed_process.returncode == 0, completed_process.stderr
+    assert _read_barcode(output_path) == (4, 3, RGB_COLORS)
+
+
+def test_installed_command_processes_nested_batch_sources(tmp_path: Path) -> None:
+    """Generate exact beside-input barcodes through the installed batch command."""
+    root = tmp_path / "library"
+    first_source = root / "Shelf A" / "Nested" / "Movie.One (2024).MKV"
+    second_source = root / "Shelf B" / "Movie Two.mkv"
+    first_source.parent.mkdir(parents=True)
+    second_source.parent.mkdir(parents=True)
+    _write_lossless_fixture(first_source)
+    _write_lossless_fixture(second_source)
+
+    completed_process = _run_cinebar(
+        [
+            "batch",
+            str(root),
+            "--height",
+            "3",
+            "--workers",
+            "1",
+            "--crop",
+            "none",
+            "--overwrite",
+        ]
+    )
+
+    assert completed_process.returncode == 0, completed_process.stderr
+    assert _read_barcode(first_source.with_name("Movie.One (2024).cinebar.png")) == (
+        4,
+        3,
+        RGB_COLORS,
+    )
+    assert _read_barcode(second_source.with_name("Movie Two.cinebar.png")) == (
+        4,
+        3,
+        RGB_COLORS,
+    )
 
 
 def _write_lossless_fixture(media_path: Path) -> None:

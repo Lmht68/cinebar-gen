@@ -62,6 +62,17 @@ from cinebar.progress import ProgressTracker
             ),
         ),
         (
+            FailureCategory.ROOT_NOT_FOUND,
+            "Batch root was not found. Verify the directory path and try again.",
+        ),
+        (
+            FailureCategory.ROOT_UNREADABLE,
+            (
+                "Batch root is not a readable directory. Check its permissions and "
+                "file type."
+            ),
+        ),
+        (
             FailureCategory.NO_VIDEO_STREAM,
             "Input media has no usable video stream. Choose a supported video file.",
         ),
@@ -96,6 +107,10 @@ from cinebar.progress import ProgressTracker
                 "The barcode could not be written. Check destination permissions and "
                 "available space."
             ),
+        ),
+        (
+            FailureCategory.OUTPUT_COLLISION,
+            "Distinct input media files map to the same barcode output.",
         ),
         (
             FailureCategory.INTERRUPTED,

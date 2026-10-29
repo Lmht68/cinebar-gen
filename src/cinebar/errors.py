@@ -12,12 +12,15 @@ class FailureCategory(StrEnum):
     NON_BLACK_CROP_BOUNDARY = "non_black_crop_boundary"
     INPUT_NOT_FOUND = "input_not_found"
     INPUT_UNREADABLE = "input_unreadable"
+    ROOT_NOT_FOUND = "root_not_found"
+    ROOT_UNREADABLE = "root_unreadable"
     NO_VIDEO_STREAM = "no_video_stream"
     ZERO_FRAMES = "zero_frames"
     DECODE_FAILED = "decode_failed"
     CORRUPT_FRAME = "corrupt_frame"
     OUTPUT_EXISTS = "output_exists"
     OUTPUT_WRITE_FAILED = "output_write_failed"
+    OUTPUT_COLLISION = "output_collision"
     INTERRUPTED = "interrupted"
 
 
@@ -41,6 +44,12 @@ _FAILURE_MESSAGES: dict[FailureCategory, str] = {
         "Input media is not a readable regular file. Check its permissions and "
         "file type."
     ),
+    FailureCategory.ROOT_NOT_FOUND: (
+        "Batch root was not found. Verify the directory path and try again."
+    ),
+    FailureCategory.ROOT_UNREADABLE: (
+        "Batch root is not a readable directory. Check its permissions and file type."
+    ),
     FailureCategory.NO_VIDEO_STREAM: (
         "Input media has no usable video stream. Choose a supported video file."
     ),
@@ -62,6 +71,9 @@ _FAILURE_MESSAGES: dict[FailureCategory, str] = {
     FailureCategory.OUTPUT_WRITE_FAILED: (
         "The barcode could not be written. Check destination permissions and available "
         "space."
+    ),
+    FailureCategory.OUTPUT_COLLISION: (
+        "Distinct input media files map to the same barcode output."
     ),
     FailureCategory.INTERRUPTED: (
         "Processing was interrupted; no new barcode was published."
