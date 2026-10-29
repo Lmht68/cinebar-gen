@@ -133,6 +133,26 @@ def test_cinebar_error_is_picklable_and_path_safe(
     assert str(restored_error) == message
 
 
+def test_cinebar_error_preserves_safe_detail_through_pickling() -> None:
+    """Retain explicitly safe details in error text and serialized arguments."""
+    safe_detail = (
+        "Destination: C:\\barcodes\\Movie.png\n"
+        "Conflicting inputs:\n"
+        "- C:\\media\\Movie.mkv"
+    )
+    error = CinebarError(FailureCategory.OUTPUT_COLLISION, safe_detail)
+
+    restored_error = pickle.loads(pickle.dumps(error))
+
+    assert error.args == (FailureCategory.OUTPUT_COLLISION, safe_detail)
+    assert str(error) == (
+        f"Distinct input media files map to the same barcode output.\n{safe_detail}"
+    )
+    assert restored_error.args == (FailureCategory.OUTPUT_COLLISION, safe_detail)
+    assert restored_error.category is FailureCategory.OUTPUT_COLLISION
+    assert str(restored_error) == str(error)
+
+
 class _SequentialCapture:
     """Minimal opened capture returning predetermined sequential read results."""
 

@@ -86,19 +86,33 @@ class CinebarError(Exception):
 
     Args:
         category: Stable category describing the failure.
+        safe_detail: Optional caller-provided detail that is safe to expose.
     """
 
     category: FailureCategory
+    safe_detail: str | None
 
-    def __init__(self, category: FailureCategory) -> None:
-        """Create a failure with a fixed safe message.
+    def __init__(
+        self,
+        category: FailureCategory,
+        safe_detail: str | None = None,
+    ) -> None:
+        """Create a failure with a fixed message and optional safe detail.
 
         Args:
             category: Stable category describing the failure.
+            safe_detail: Optional caller-provided detail that is safe to expose.
         """
         self.category = category
-        super().__init__(category)
+        self.safe_detail = safe_detail
+        if safe_detail is None:
+            super().__init__(category)
+        else:
+            super().__init__(category, safe_detail)
 
     def __str__(self) -> str:
-        """Return the path-safe actionable failure message."""
-        return _FAILURE_MESSAGES[self.category]
+        """Return the actionable failure message and any safe detail."""
+        message = _FAILURE_MESSAGES[self.category]
+        if self.safe_detail is None:
+            return message
+        return f"{message}\n{self.safe_detail}"

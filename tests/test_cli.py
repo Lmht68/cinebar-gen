@@ -216,6 +216,7 @@ def test_installed_command_processes_nested_batch_sources(tmp_path: Path) -> Non
         [
             "batch",
             str(root),
+            "--output-beside-input",
             "--height",
             "3",
             "--workers",
@@ -237,6 +238,132 @@ def test_installed_command_processes_nested_batch_sources(tmp_path: Path) -> Non
         3,
         RGB_COLORS,
     )
+
+
+def test_installed_command_defaults_output_directory_to_mirrored_layout(
+    tmp_path: Path,
+) -> None:
+    """Write nested batch sources under the output directory by default."""
+    root = tmp_path / "library"
+    first_source = root / "Shelf A" / "Nested" / "Movie.One (2024).MKV"
+    second_source = root / "Shelf B" / "Movie Two.mkv"
+    output_dir = tmp_path / "barcodes"
+    first_source.parent.mkdir(parents=True)
+    second_source.parent.mkdir(parents=True)
+    _write_lossless_fixture(first_source)
+    _write_lossless_fixture(second_source)
+
+    completed_process = _run_cinebar(
+        [
+            "batch",
+            str(root),
+            "--output-dir",
+            str(output_dir),
+            "--height",
+            "3",
+            "--workers",
+            "1",
+            "--crop",
+            "none",
+            "--overwrite",
+        ]
+    )
+
+    assert completed_process.returncode == 0, completed_process.stderr
+    assert _read_barcode(
+        output_dir / "Shelf A" / "Nested" / "Movie.One (2024).cinebar.png"
+    ) == (4, 3, RGB_COLORS)
+    assert _read_barcode(output_dir / "Shelf B" / "Movie Two.cinebar.png") == (
+        4,
+        3,
+        RGB_COLORS,
+    )
+
+
+def test_installed_command_writes_explicit_flat_output_layout(tmp_path: Path) -> None:
+    """Write each batch source directly below the configured output directory."""
+    root = tmp_path / "library"
+    first_source = root / "Shelf A" / "Movie.One (2024).MKV"
+    second_source = root / "Shelf B" / "Movie Two.mkv"
+    output_dir = tmp_path / "barcodes"
+    first_source.parent.mkdir(parents=True)
+    second_source.parent.mkdir(parents=True)
+    _write_lossless_fixture(first_source)
+    _write_lossless_fixture(second_source)
+
+    completed_process = _run_cinebar(
+        [
+            "batch",
+            str(root),
+            "--output-dir",
+            str(output_dir),
+            "--output-layout",
+            "flat",
+            "--height",
+            "3",
+            "--workers",
+            "1",
+            "--crop",
+            "none",
+            "--overwrite",
+        ]
+    )
+
+    assert completed_process.returncode == 0, completed_process.stderr
+    assert _read_barcode(output_dir / "Movie.One (2024).png") == (
+        4,
+        3,
+        RGB_COLORS,
+    )
+    assert _read_barcode(output_dir / "Movie Two.png") == (4, 3, RGB_COLORS)
+
+
+def test_installed_command_rejects_flat_collisions_with_overwrite(
+    tmp_path: Path,
+) -> None:
+    """Report every flat collision source without publishing the shared PNG."""
+    root = tmp_path / "library"
+    first_source = root / "Shelf A" / "Movie.mkv"
+    second_source = root / "Shelf B" / "Movie.mkv"
+    output_dir = tmp_path / "barcodes"
+    first_source.parent.mkdir(parents=True)
+    second_source.parent.mkdir(parents=True)
+    _write_lossless_fixture(first_source)
+    _write_lossless_fixture(second_source)
+
+    completed_process = _run_cinebar(
+        [
+            "batch",
+            str(root),
+            "--output-dir",
+            str(output_dir),
+            "--output-layout",
+            "flat",
+            "--overwrite",
+        ]
+    )
+
+    assert completed_process.returncode == 1
+    assert f"Destination: {output_dir / 'Movie.png'}" in completed_process.stderr
+    assert f"- {first_source}" in completed_process.stderr
+    assert f"- {second_source}" in completed_process.stderr
+    assert not (output_dir / "Movie.png").exists()
+
+
+def test_installed_command_documents_batch_output_layouts() -> None:
+    """Expose every batch placement option, accepted layout, and both defaults."""
+    completed_process = _run_cinebar(["batch", "--help"])
+
+    assert completed_process.returncode == 0, completed_process.stderr
+    help_text = " ".join(completed_process.stdout.split())
+    assert "--output-beside-input" in help_text
+    assert "--output-dir PATH" in help_text
+    assert "--output-layout {mirrored,flat}" in help_text
+    assert (
+        "Write <source parent>/<stem>.cinebar.png. Default without --output-dir."
+        in (help_text)
+    )
+    assert "Default layout with this option." in help_text
 
 
 def _write_lossless_fixture(media_path: Path) -> None:
@@ -526,6 +653,47 @@ def test_installed_command_routes_parser_errors_through_logging(
         "Invalid command-line arguments. Run 'cinebar --help' for usage.",
         media_path,
     )
+
+
+@pytest.mark.parametrize(
+    "placement_arguments",
+    [
+        ("--output-beside-input", "--output-dir", "{output_dir}"),
+        ("--output-layout", "flat"),
+        ("--output-dir", "{output_dir}", "--output-layout", "unsupported"),
+    ],
+)
+def test_installed_command_rejects_invalid_batch_output_placement_before_publish(
+    tmp_path: Path,
+    placement_arguments: tuple[str, ...],
+) -> None:
+    """Reject invalid output-placement flags without generating a barcode."""
+    root = tmp_path / "library"
+    source = root / "Movie.mkv"
+    output_dir = tmp_path / "output"
+    root.mkdir()
+    _write_lossless_fixture(source)
+
+    completed_process = _run_cinebar(
+        [
+            "batch",
+            str(root),
+            *[
+                str(output_dir) if argument == "{output_dir}" else argument
+                for argument in placement_arguments
+            ],
+        ]
+    )
+
+    _assert_installed_failure(
+        completed_process,
+        "invalid_argument",
+        "Invalid command-line arguments. Run 'cinebar --help' for usage.",
+        source,
+    )
+    assert completed_process.returncode == 1
+    assert not source.with_name("Movie.cinebar.png").exists()
+    assert not output_dir.exists()
 
 
 def test_installed_command_preserves_existing_output_without_overwrite(

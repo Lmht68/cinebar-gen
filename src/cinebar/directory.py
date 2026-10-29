@@ -1,8 +1,9 @@
-"""Process stable media files recursively into beside-input barcodes."""
+"""Process stable media files recursively into configured barcode layouts."""
 
 import os
 import stat
 from dataclasses import dataclass
+from enum import StrEnum
 from os.path import abspath, normcase
 from pathlib import Path
 from stat import S_ISDIR, S_ISREG
@@ -50,6 +51,35 @@ def _is_reparse_point(entry_status: os.stat_result) -> bool:
     )
 
 
+def _is_within_directory(path: Path, directory: Path, *, strict: bool) -> bool:
+    """Return whether a normalized absolute path is under a directory."""
+    normalized_path = normcase(abspath(path))
+    normalized_directory = normcase(abspath(directory))
+    if strict and normalized_path == normalized_directory:
+        return False
+    try:
+        return (
+            normcase(os.path.commonpath((normalized_path, normalized_directory)))
+            == normalized_directory
+        )
+    except ValueError:
+        return False
+
+
+def _path_sort_key(path: Path) -> tuple[str, str]:
+    """Return a stable normalized and absolute path sort key."""
+    absolute_path = abspath(path)
+    return (normcase(absolute_path), absolute_path)
+
+
+class OutputLayout(StrEnum):
+    """Describe how batch sources map to barcode destinations."""
+
+    BESIDE_INPUT = "beside-input"
+    MIRRORED = "mirrored"
+    FLAT = "flat"
+
+
 @dataclass(frozen=True, slots=True)
 class GenerationSettings:
     """Describe settings shared by every media file in one batch.
@@ -59,12 +89,30 @@ class GenerationSettings:
         workers: Process count, or ``None`` for the processor default.
         crop: Automatic, disabled, or fixed picture-region crop selection.
         overwrite: Whether existing final PNGs may be replaced.
+        output_dir: Optional directory for mirrored or flat barcode destinations.
+        output_layout: Explicit layout, or ``None`` for beside-input without
+            ``output_dir`` and mirrored with it.
     """
 
     height: int = 100
     workers: int | None = None
     crop: CropSelection = CropMode.AUTO
     overwrite: bool = False
+    output_dir: Path | None = None
+    output_layout: OutputLayout | None = None
+
+    def __post_init__(self) -> None:
+        """Reject output directory and layout combinations without a valid meaning."""
+        if (
+            self.output_dir is not None
+            and self.output_layout is OutputLayout.BESIDE_INPUT
+        ):
+            raise CinebarError(FailureCategory.INVALID_ARGUMENT)
+        if self.output_dir is None and self.output_layout in (
+            OutputLayout.MIRRORED,
+            OutputLayout.FLAT,
+        ):
+            raise CinebarError(FailureCategory.INVALID_ARGUMENT)
 
 
 class BarcodeGenerator(Protocol):
@@ -85,7 +133,7 @@ class BarcodeGenerator(Protocol):
 
 
 class DirectoryProcessor:
-    """Generate beside-input barcodes for stable media in one directory tree."""
+    """Generate configured barcodes for stable media in one directory tree."""
 
     def __init__(self, barcode_generator: BarcodeGenerator | None = None) -> None:
         """Create a directory processor with an injectable barcode generator.
@@ -101,7 +149,7 @@ class DirectoryProcessor:
         settings: GenerationSettings = GenerationSettings(),  # noqa: B008
         progress_reporter: ProgressReporter | None = None,
     ) -> tuple[ProcessingResult, ...]:
-        """Generate one beside-input barcode for every supported media file.
+        """Generate one barcode for every supported media file using settings.
 
         Args:
             root: Directory tree containing stable source media files.
@@ -120,16 +168,72 @@ class DirectoryProcessor:
         if _is_reparse_point(root_status) or not S_ISDIR(root_status.st_mode):
             raise CinebarError(FailureCategory.ROOT_UNREADABLE)
 
-        sources = _discover_sources(root)
-        output_sources: dict[str, Path] = {}
+        excluded_directory = (
+            settings.output_dir
+            if settings.output_dir is not None
+            and _is_within_directory(settings.output_dir, root, strict=True)
+            else None
+        )
+        sources = _discover_sources(root, excluded_directory)
+        output_sources: dict[str, tuple[Path, list[Path]]] = {}
         plans: list[tuple[Path, Path]] = []
         for source in sources:
-            output_path = source.with_name(f"{source.stem}.cinebar.png")
+            if settings.output_dir is None:
+                output_path = source.with_name(f"{source.stem}.cinebar.png")
+            elif settings.output_layout is OutputLayout.FLAT:
+                output_path = settings.output_dir / f"{source.stem}.png"
+            else:
+                output_path = (
+                    settings.output_dir
+                    / source.parent.relative_to(root)
+                    / f"{source.stem}.cinebar.png"
+                )
             output_key = normcase(abspath(output_path))
-            if output_key in output_sources:
-                raise CinebarError(FailureCategory.OUTPUT_COLLISION)
-            output_sources[output_key] = source
+            source_paths = output_sources.setdefault(
+                output_key,
+                (Path(abspath(output_path)), []),
+            )[1]
+            source_paths.append(Path(abspath(source)))
             plans.append((source, output_path))
+
+        collisions = [
+            (destination, source_paths)
+            for destination, source_paths in output_sources.values()
+            if len(source_paths) >= 2
+        ]
+        if collisions:
+            safe_detail = "\n\n".join(
+                "\n".join(
+                    [
+                        f"Destination: {destination}",
+                        "Conflicting inputs:",
+                        *(
+                            f"- {source}"
+                            for source in sorted(source_paths, key=_path_sort_key)
+                        ),
+                    ]
+                )
+                for destination, source_paths in sorted(
+                    collisions,
+                    key=lambda group: _path_sort_key(group[0]),
+                )
+            )
+            raise CinebarError(FailureCategory.OUTPUT_COLLISION, safe_detail)
+
+        destination_parents: dict[str, Path] = {}
+        for _, output_path in plans:
+            destination_parents.setdefault(
+                normcase(abspath(output_path.parent)),
+                output_path.parent,
+            )
+        try:
+            for output_parent in sorted(
+                destination_parents.values(),
+                key=_path_sort_key,
+            ):
+                output_parent.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            raise CinebarError(FailureCategory.OUTPUT_WRITE_FAILED) from None
 
         return tuple(
             self._barcode_generator.process(
@@ -145,8 +249,16 @@ class DirectoryProcessor:
         )
 
 
-def _discover_sources(root: Path) -> list[Path]:
-    """Return supported regular files found without following links."""
+def _discover_sources(
+    root: Path,
+    excluded_directory: Path | None = None,
+) -> list[Path]:
+    """Return supported regular files found without following links.
+
+    Args:
+        root: Directory tree to scan.
+        excluded_directory: Optional directory tree omitted from discovery.
+    """
     directories = [root]
     sources: list[Path] = []
 
@@ -165,6 +277,12 @@ def _discover_sources(root: Path) -> list[Path]:
                         continue
 
                     entry_path = Path(entry.path)
+                    if excluded_directory is not None and _is_within_directory(
+                        entry_path,
+                        excluded_directory,
+                        strict=False,
+                    ):
+                        continue
                     if S_ISDIR(entry_status.st_mode):
                         directories.append(entry_path)
                     elif S_ISREG(entry_status.st_mode) and (
@@ -176,4 +294,4 @@ def _discover_sources(root: Path) -> list[Path]:
         except OSError:
             raise CinebarError(FailureCategory.ROOT_UNREADABLE) from None
 
-    return sorted(sources, key=lambda path: normcase(abspath(path)))
+    return sorted(sources, key=_path_sort_key)

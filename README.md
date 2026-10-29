@@ -33,16 +33,39 @@ uv run cinebar movie.mp4 --output movie-barcode.png --workers 8 --crop none
 
 ## Generate barcodes in a directory tree
 
-```console
-uv run cinebar batch ROOT
-```
-
 Batch mode recursively scans `ROOT` for case-insensitive `.avi`, `.m2ts`, `.m4v`, `.mkv`, `.mov`, `.mp4`, `.mpeg`, `.mpg`, `.mts`, `.ts`, `.webm`, and `.wmv` sources.
 It skips dot-prefixed and host-hidden entries, symlinks, and Windows reparse points.
 Each movie is generated one at a time, using the normal `--height`, `--workers`, `--crop`, and `--overwrite` options.
-Each barcode is written beside its source as `<stem>.cinebar.png`.
 Source files must already be stable before batch processing starts.
-If distinct source files map to one barcode path, the batch aborts before generating any barcode.
+
+Without an output directory, each barcode is beside its source at `<source parent>/<stem>.cinebar.png`.
+
+```console
+uv run cinebar batch ROOT --output-beside-input
+```
+
+`--output-beside-input` is optional when no output directory is supplied.
+
+With `--output-dir DEST`, Cinebar creates destination parents and mirrors each source-relative directory under `DEST`.
+The default destination is `DEST/<source path relative to ROOT>/<stem>.cinebar.png`.
+
+```console
+uv run cinebar batch ROOT --output-dir DEST
+```
+
+Use the explicit flat layout to write each barcode directly under `DEST` as `<stem>.png`.
+
+```console
+uv run cinebar batch ROOT --output-dir DEST --output-layout flat
+```
+
+`--output-beside-input` and `--output-dir` are mutually exclusive.
+`--output-layout` requires `--output-dir` and accepts `mirrored` or `flat`.
+When `DEST` is a strict descendant of `ROOT`, its entire tree is excluded from source discovery.
+
+Before destination creation or generation, Cinebar compares normalized absolute destination paths.
+If two or more sources share one destination, it reports every shared destination and conflicting input, then publishes no barcode.
+`--overwrite` permits replacement of an existing output, but never permits multiple sources to share a destination.
 
 ## Progress reporting
 

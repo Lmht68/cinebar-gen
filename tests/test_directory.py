@@ -13,6 +13,7 @@ from cinebar import (
     DirectoryProcessor,
     FailureCategory,
     GenerationSettings,
+    OutputLayout,
     ProcessingResult,
 )
 from cinebar.crop import CropSelection
@@ -32,6 +33,25 @@ VIDEO_SUFFIXES = (
     ".webm",
     ".wmv",
 )
+
+
+@pytest.mark.parametrize(
+    ("output_dir", "output_layout"),
+    [
+        (Path("output"), OutputLayout.BESIDE_INPUT),
+        (None, OutputLayout.MIRRORED),
+        (None, OutputLayout.FLAT),
+    ],
+)
+def test_generation_settings_rejects_invalid_output_placement_combinations(
+    output_dir: Path | None,
+    output_layout: OutputLayout,
+) -> None:
+    """Reject output layouts whose required directory relationship is absent."""
+    with pytest.raises(CinebarError) as raised_error:
+        GenerationSettings(output_dir=output_dir, output_layout=output_layout)
+
+    assert raised_error.value.category is FailureCategory.INVALID_ARGUMENT
 
 
 def _mark_hidden(path: Path) -> None:
@@ -169,6 +189,164 @@ def test_directory_processor_generates_nested_barcodes_beside_sources(
         b"First.mkv",
         b"Second.MP4",
     ]
+
+
+def test_directory_processor_supports_explicit_beside_input_layout(
+    tmp_path: Path,
+) -> None:
+    """Honor explicit beside-input placement without an output directory."""
+    root = tmp_path / "library"
+    source = root / "Movie.mkv"
+    root.mkdir()
+    source.write_bytes(b"source")
+
+    results = DirectoryProcessor(_WritingBarcodeGenerator()).process_batch(
+        root,
+        GenerationSettings(output_layout=OutputLayout.BESIDE_INPUT),
+    )
+
+    assert tuple(result.output_path for result in results) == (
+        source.with_name("Movie.cinebar.png"),
+    )
+
+
+def test_directory_processor_mirrors_explicit_output_layout(
+    tmp_path: Path,
+) -> None:
+    """Write an explicit mirrored output into the configured output directory."""
+    root = tmp_path / "library"
+    source = root / "Movie.mkv"
+    output_dir = tmp_path / "barcodes"
+    root.mkdir()
+    output_dir.mkdir()
+    source.write_bytes(b"source")
+
+    results = DirectoryProcessor(_WritingBarcodeGenerator()).process_batch(
+        root,
+        GenerationSettings(
+            output_dir=output_dir,
+            output_layout=OutputLayout.MIRRORED,
+        ),
+    )
+
+    assert tuple(result.output_path for result in results) == (
+        output_dir / "Movie.cinebar.png",
+    )
+
+
+def test_directory_processor_defaults_output_directory_to_mirrored_layout(
+    tmp_path: Path,
+) -> None:
+    """Mirror source-relative paths when only an output directory is configured."""
+    root = tmp_path / "library"
+    source = root / "Shelf" / "Movie.mkv"
+    output_dir = tmp_path / "barcodes"
+    source.parent.mkdir(parents=True)
+    (output_dir / "Shelf").mkdir(parents=True)
+    source.write_bytes(b"source")
+
+    results = DirectoryProcessor(_WritingBarcodeGenerator()).process_batch(
+        root,
+        GenerationSettings(output_dir=output_dir),
+    )
+
+    assert tuple(result.output_path for result in results) == (
+        output_dir / "Shelf" / "Movie.cinebar.png",
+    )
+
+
+def test_directory_processor_flattens_explicit_output_layout(
+    tmp_path: Path,
+) -> None:
+    """Write an explicit flat output directly below the output directory."""
+    root = tmp_path / "library"
+    source = root / "Shelf" / "Movie.mkv"
+    output_dir = tmp_path / "barcodes"
+    source.parent.mkdir(parents=True)
+    output_dir.mkdir()
+    source.write_bytes(b"source")
+
+    results = DirectoryProcessor(_WritingBarcodeGenerator()).process_batch(
+        root,
+        GenerationSettings(
+            output_dir=output_dir,
+            output_layout=OutputLayout.FLAT,
+        ),
+    )
+
+    assert tuple(result.output_path for result in results) == (
+        output_dir / "Movie.png",
+    )
+
+
+def test_directory_processor_preserves_exact_stem_in_flat_layout(
+    tmp_path: Path,
+) -> None:
+    """Copy spaces, case, dots, and year text exactly from Path.stem."""
+    root = tmp_path / "library"
+    source = root / "Movie.One (2024).MKV"
+    output_dir = tmp_path / "barcodes"
+    root.mkdir()
+    output_dir.mkdir()
+    source.write_bytes(b"source")
+
+    results = DirectoryProcessor(_WritingBarcodeGenerator()).process_batch(
+        root,
+        GenerationSettings(
+            output_dir=output_dir,
+            output_layout=OutputLayout.FLAT,
+        ),
+    )
+
+    assert tuple(result.output_path.name for result in results) == (
+        "Movie.One (2024).png",
+    )
+
+
+def test_directory_processor_creates_mirrored_destination_parents(
+    tmp_path: Path,
+) -> None:
+    """Create every nested destination parent before barcode generation."""
+    root = tmp_path / "library"
+    source = root / "Shelf" / "Nested" / "Movie.mkv"
+    output_dir = tmp_path / "barcodes"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"source")
+
+    results = DirectoryProcessor(_WritingBarcodeGenerator()).process_batch(
+        root,
+        GenerationSettings(output_dir=output_dir),
+    )
+
+    expected_output = output_dir / "Shelf" / "Nested" / "Movie.cinebar.png"
+    assert tuple(result.output_path for result in results) == (expected_output,)
+    assert expected_output.read_bytes() == b"Movie.mkv"
+
+
+def test_directory_processor_excludes_nested_output_directory(
+    tmp_path: Path,
+) -> None:
+    """Ignore every source within an output tree nested under the batch root."""
+    root = tmp_path / "library"
+    source = root / "Keep.mkv"
+    output_dir = root / "barcodes"
+    excluded_source = output_dir / "Previous.mkv"
+    sibling_source = root / "barcodes-old" / "StillProcess.mkv"
+    root.mkdir()
+    output_dir.mkdir()
+    sibling_source.parent.mkdir()
+    source.write_bytes(b"source")
+    excluded_source.write_bytes(b"previous source")
+    sibling_source.write_bytes(b"sibling source")
+    barcode_generator = _WritingBarcodeGenerator()
+
+    DirectoryProcessor(barcode_generator).process_batch(
+        root,
+        GenerationSettings(output_dir=output_dir),
+    )
+
+    assert [call[0] for call in barcode_generator.calls] == [sibling_source, source]
+    assert (output_dir / "Keep.cinebar.png").read_bytes() == b"Keep.mkv"
 
 
 def test_directory_processor_rejects_missing_root_before_generation(
@@ -341,14 +519,171 @@ def test_directory_processor_preserves_source_stems_in_beside_input_names(
     )
 
 
-def test_directory_processor_rejects_output_collisions_before_generation(
+@pytest.mark.parametrize(
+    ("output_layout", "expected_filename"),
+    [
+        (OutputLayout.BESIDE_INPUT, "Movie.cinebar.png"),
+        (OutputLayout.MIRRORED, "Movie.cinebar.png"),
+        (OutputLayout.FLAT, "Movie.png"),
+    ],
+)
+def test_directory_processor_reports_same_stem_collisions_in_all_layouts(
+    tmp_path: Path,
+    output_layout: OutputLayout,
+    expected_filename: str,
+) -> None:
+    """Reject same-stem inputs before generation, even with overwrite enabled."""
+    root = tmp_path / "library"
+    first_source = root / "Movie.mkv"
+    second_source = root / "Movie.mp4"
+    output_dir = tmp_path / "barcodes"
+    root.mkdir()
+    first_source.write_bytes(b"mkv")
+    second_source.write_bytes(b"mp4")
+    settings = GenerationSettings(
+        overwrite=True,
+        output_dir=(None if output_layout is OutputLayout.BESIDE_INPUT else output_dir),
+        output_layout=output_layout,
+    )
+    expected_destination = (
+        first_source.with_name(expected_filename)
+        if output_layout is OutputLayout.BESIDE_INPUT
+        else output_dir / expected_filename
+    )
+    expected_sources = sorted(
+        (first_source, second_source),
+        key=lambda path: (
+            os.path.normcase(os.path.abspath(path)),
+            os.path.abspath(path),
+        ),
+    )
+    expected_detail = "\n".join(
+        [
+            f"Destination: {os.path.abspath(expected_destination)}",
+            "Conflicting inputs:",
+            *(f"- {os.path.abspath(source)}" for source in expected_sources),
+        ]
+    )
+    barcode_generator = _WritingBarcodeGenerator()
+
+    with pytest.raises(CinebarError) as raised_error:
+        DirectoryProcessor(barcode_generator).process_batch(root, settings)
+
+    assert raised_error.value.category is FailureCategory.OUTPUT_COLLISION
+    assert raised_error.value.args == (
+        FailureCategory.OUTPUT_COLLISION,
+        expected_detail,
+    )
+    assert str(raised_error.value) == (
+        f"Distinct input media files map to the same barcode output.\n{expected_detail}"
+    )
+    assert barcode_generator.calls == []
+
+
+def test_directory_processor_reports_flat_collisions_across_source_folders(
     tmp_path: Path,
 ) -> None:
-    """Abort the whole batch before either source maps to one output path."""
+    """Reject flat outputs shared by same-stem sources in different folders."""
+    root = tmp_path / "library"
+    first_source = root / "Shelf A" / "Movie.mkv"
+    second_source = root / "Shelf B" / "Movie.mkv"
+    output_dir = tmp_path / "barcodes"
+    first_source.parent.mkdir(parents=True)
+    second_source.parent.mkdir(parents=True)
+    first_source.write_bytes(b"first")
+    second_source.write_bytes(b"second")
+
+    with pytest.raises(CinebarError) as raised_error:
+        DirectoryProcessor(_WritingBarcodeGenerator()).process_batch(
+            root,
+            GenerationSettings(
+                output_dir=output_dir,
+                output_layout=OutputLayout.FLAT,
+            ),
+        )
+
+    assert raised_error.value.category is FailureCategory.OUTPUT_COLLISION
+    assert f"Destination: {os.path.abspath(output_dir / 'Movie.png')}" in str(
+        raised_error.value
+    )
+
+
+def test_directory_processor_uses_host_case_rules_for_collision_keys(
+    tmp_path: Path,
+) -> None:
+    """Apply the host path module's case behavior to destination collisions."""
+    root = tmp_path / "library"
+    first_source = root / "Movie.mkv"
+    second_source = root / "movie.mp4"
+    output_dir = tmp_path / "barcodes"
+    root.mkdir()
+    first_source.write_bytes(b"first")
+    second_source.write_bytes(b"second")
+    settings = GenerationSettings(
+        output_dir=output_dir,
+        output_layout=OutputLayout.FLAT,
+    )
+
+    if os.path.normcase("Movie.png") == os.path.normcase("movie.png"):
+        with pytest.raises(CinebarError) as raised_error:
+            DirectoryProcessor(_WritingBarcodeGenerator()).process_batch(root, settings)
+
+        assert raised_error.value.category is FailureCategory.OUTPUT_COLLISION
+        assert f"Destination: {os.path.abspath(output_dir / 'Movie.png')}" in str(
+            raised_error.value
+        )
+    else:
+        results = DirectoryProcessor(_WritingBarcodeGenerator()).process_batch(
+            root,
+            settings,
+        )
+
+        assert len(results) == 2
+
+
+def test_directory_processor_reports_every_collision_group_and_source(
+    tmp_path: Path,
+) -> None:
+    """Report every colliding destination and each of its source paths."""
     root = tmp_path / "library"
     root.mkdir()
-    (root / "Movie.mkv").write_bytes(b"mkv")
-    (root / "Movie.mp4").write_bytes(b"mp4")
+    alpha_sources = (
+        root / "Alpha.mkv",
+        root / "Alpha.mov",
+        root / "Alpha.mp4",
+    )
+    beta_sources = (root / "Beta.mkv", root / "Beta.mp4")
+    for source in (*alpha_sources, *beta_sources):
+        source.write_bytes(source.suffix.encode())
+    collision_groups = (
+        (root / "Alpha.cinebar.png", alpha_sources),
+        (root / "Beta.cinebar.png", beta_sources),
+    )
+    expected_detail = "\n\n".join(
+        "\n".join(
+            [
+                f"Destination: {os.path.abspath(destination)}",
+                "Conflicting inputs:",
+                *(
+                    f"- {os.path.abspath(source)}"
+                    for source in sorted(
+                        sources,
+                        key=lambda path: (
+                            os.path.normcase(os.path.abspath(path)),
+                            os.path.abspath(path),
+                        ),
+                    )
+                ),
+            ]
+        )
+        for destination, sources in sorted(
+            collision_groups,
+            key=lambda group: (
+                os.path.normcase(os.path.abspath(group[0])),
+                os.path.abspath(group[0]),
+            ),
+        )
+    )
     barcode_generator = _WritingBarcodeGenerator()
 
     with pytest.raises(CinebarError) as raised_error:
@@ -358,6 +693,11 @@ def test_directory_processor_rejects_output_collisions_before_generation(
         )
 
     assert raised_error.value.category is FailureCategory.OUTPUT_COLLISION
+    assert raised_error.value.args == (
+        FailureCategory.OUTPUT_COLLISION,
+        expected_detail,
+    )
+    assert str(raised_error.value).endswith(expected_detail)
     assert barcode_generator.calls == []
 
 

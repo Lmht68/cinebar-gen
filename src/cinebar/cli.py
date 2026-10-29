@@ -10,7 +10,7 @@ from typing import NoReturn
 
 from .console import ConsoleProgressRenderer
 from .crop import CropMode, CropRectangle, CropSelection
-from .directory import DirectoryProcessor, GenerationSettings
+from .directory import DirectoryProcessor, GenerationSettings, OutputLayout
 from .errors import CinebarError, FailureCategory
 from .processor import SingleFileProcessor
 
@@ -78,14 +78,42 @@ def _build_single_file_parser() -> _CinebarArgumentParser:
 
 
 def _build_batch_parser() -> _CinebarArgumentParser:
-    """Build the parser for recursive beside-input barcode generation."""
+    """Build the parser for recursive batch barcode generation."""
     parser = _CinebarArgumentParser(
-        description="Generate beside-input barcodes from a stable media directory."
+        description=(
+            "Generate barcodes from a stable media directory. Outputs default to "
+            "beside-input, or mirrored paths under --output-dir."
+        )
     )
     parser.add_argument(
         "root",
         type=Path,
         help="Directory tree containing stable media files to process.",
+    )
+    output_group = parser.add_mutually_exclusive_group()
+    output_group.add_argument(
+        "--output-beside-input",
+        action="store_true",
+        help="Write <source parent>/<stem>.cinebar.png. Default without --output-dir.",
+    )
+    output_group.add_argument(
+        "--output-dir",
+        type=Path,
+        metavar="PATH",
+        help=(
+            "Write mirrored <relative parent>/<stem>.cinebar.png under PATH. "
+            "Default layout with this option."
+        ),
+    )
+    parser.add_argument(
+        "--output-layout",
+        type=OutputLayout,
+        choices=(OutputLayout.MIRRORED, OutputLayout.FLAT),
+        metavar="{mirrored,flat}",
+        help=(
+            "With --output-dir, write mirrored <relative parent>/<stem>.cinebar.png "
+            "or flat <stem>.png."
+        ),
     )
     _add_generation_options(
         parser,
@@ -125,6 +153,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         if _is_batch_command(arguments):
             batch_arguments = _build_batch_parser().parse_args(arguments[1:])
+            if (
+                batch_arguments.output_layout is not None
+                and batch_arguments.output_dir is None
+            ):
+                raise CinebarError(FailureCategory.INVALID_ARGUMENT)
+            output_layout = (
+                OutputLayout.BESIDE_INPUT
+                if batch_arguments.output_beside_input
+                else batch_arguments.output_layout
+            )
             renderer = ConsoleProgressRenderer()
             DirectoryProcessor().process_batch(
                 root=batch_arguments.root,
@@ -133,6 +171,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     workers=batch_arguments.workers,
                     crop=batch_arguments.crop,
                     overwrite=batch_arguments.overwrite,
+                    output_dir=batch_arguments.output_dir,
+                    output_layout=output_layout,
                 ),
                 progress_reporter=renderer,
             )
