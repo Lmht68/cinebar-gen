@@ -2,6 +2,7 @@
 
 import argparse
 import logging
+import math
 import sys
 from collections.abc import Sequence
 from multiprocessing import freeze_support
@@ -115,6 +116,24 @@ def _build_batch_parser() -> _CinebarArgumentParser:
             "or flat <stem>.png."
         ),
     )
+    parser.add_argument(
+        "--settling-period",
+        type=_positive_duration,
+        default=5.0,
+        metavar="SECONDS",
+        help=(
+            "Require size and nanosecond modification time to remain unchanged "
+            "across observations. Defaults to 5 seconds; metadata stability is "
+            "a heuristic, not proof that copying has finished."
+        ),
+    )
+    parser.add_argument(
+        "--readiness-timeout",
+        type=_positive_duration,
+        default=300.0,
+        metavar="SECONDS",
+        help="Limit readiness observations. Defaults to 300 seconds.",
+    )
     _add_generation_options(
         parser,
         height_help="Barcode height in pixels. Defaults to 100.",
@@ -144,7 +163,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         argv: Optional command-line arguments excluding the program name.
 
     Returns:
-        Zero after publication, one after a failure, or 130 after interruption.
+        Zero after publication, two after batch readiness failures, one after a
+        fatal failure, or 130 after interruption.
     """
     freeze_support()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
@@ -164,7 +184,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 else batch_arguments.output_layout
             )
             renderer = ConsoleProgressRenderer()
-            DirectoryProcessor().process_batch(
+            batch_result = DirectoryProcessor().process_batch(
                 root=batch_arguments.root,
                 settings=GenerationSettings(
                     height=batch_arguments.height,
@@ -173,9 +193,24 @@ def main(argv: Sequence[str] | None = None) -> int:
                     overwrite=batch_arguments.overwrite,
                     output_dir=batch_arguments.output_dir,
                     output_layout=output_layout,
+                    settling_period_seconds=batch_arguments.settling_period,
+                    readiness_timeout_seconds=batch_arguments.readiness_timeout,
                 ),
                 progress_reporter=renderer,
             )
+            renderer.finish_line()
+            if batch_result.failures:
+                for failure in batch_result.failures:
+                    failure_error = CinebarError(
+                        failure.category,
+                        f"Source: {failure.source_path}",
+                    )
+                    LOGGER.error(
+                        "[%s] %s",
+                        failure_error.category.value,
+                        failure_error,
+                    )
+                return 2
         else:
             single_file_arguments = _build_single_file_parser().parse_args(arguments)
             renderer = ConsoleProgressRenderer()
@@ -240,6 +275,27 @@ def _positive_worker_count(value: str) -> int:
     except ValueError:
         raise CinebarError(FailureCategory.INVALID_ARGUMENT) from None
     if parsed_value <= 0:
+        raise CinebarError(FailureCategory.INVALID_ARGUMENT)
+    return parsed_value
+
+
+def _positive_duration(value: str) -> float:
+    """Parse one finite strictly positive duration in seconds.
+
+    Args:
+        value: Raw command-line duration argument.
+
+    Returns:
+        Parsed finite positive seconds.
+
+    Raises:
+        CinebarError: If the value is not finite and strictly positive.
+    """
+    try:
+        parsed_value = float(value)
+    except ValueError:
+        raise CinebarError(FailureCategory.INVALID_ARGUMENT) from None
+    if not math.isfinite(parsed_value) or parsed_value <= 0:
         raise CinebarError(FailureCategory.INVALID_ARGUMENT)
     return parsed_value
 

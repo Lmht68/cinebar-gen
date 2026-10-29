@@ -223,6 +223,8 @@ def test_installed_command_processes_nested_batch_sources(tmp_path: Path) -> Non
             "1",
             "--crop",
             "none",
+            "--settling-period",
+            "0.01",
             "--overwrite",
         ]
     )
@@ -238,6 +240,56 @@ def test_installed_command_processes_nested_batch_sources(tmp_path: Path) -> Non
         3,
         RGB_COLORS,
     )
+
+
+def test_installed_command_returns_two_for_readiness_timeout(tmp_path: Path) -> None:
+    """Report a timed-out source without publishing its barcode."""
+    root = tmp_path / "library"
+    source = root / "Movie.mkv"
+    root.mkdir()
+    _write_lossless_fixture(source)
+
+    completed_process = _run_cinebar(
+        [
+            "batch",
+            str(root),
+            "--settling-period",
+            "1",
+            "--readiness-timeout",
+            "0.1",
+            "--height",
+            "3",
+            "--workers",
+            "1",
+            "--crop",
+            "none",
+        ]
+    )
+
+    assert completed_process.returncode == 2
+    assert not source.with_name("Movie.cinebar.png").exists()
+    assert "ERROR [readiness_timeout]" in completed_process.stderr
+    assert "Input media did not become ready before the batch readiness timeout." in (
+        completed_process.stderr
+    )
+    assert f"Source: {source}" in completed_process.stderr
+    assert "Traceback" not in completed_process.stderr
+
+
+def test_installed_command_reports_missing_batch_root_as_fatal(tmp_path: Path) -> None:
+    """Keep initial root discovery failures fatal and traceback-free."""
+    root = tmp_path / "sensitive-missing-library"
+
+    completed_process = _run_cinebar(["batch", str(root)])
+
+    _assert_installed_failure(
+        completed_process,
+        "root_not_found",
+        "Batch root was not found. Verify the directory path and try again.",
+        root,
+    )
+    assert completed_process.returncode == 1
+    assert "Traceback" not in completed_process.stderr
 
 
 def test_installed_command_defaults_output_directory_to_mirrored_layout(
@@ -265,6 +317,8 @@ def test_installed_command_defaults_output_directory_to_mirrored_layout(
             "1",
             "--crop",
             "none",
+            "--settling-period",
+            "0.01",
             "--overwrite",
         ]
     )
@@ -305,6 +359,8 @@ def test_installed_command_writes_explicit_flat_output_layout(tmp_path: Path) ->
             "1",
             "--crop",
             "none",
+            "--settling-period",
+            "0.01",
             "--overwrite",
         ]
     )
@@ -350,8 +406,8 @@ def test_installed_command_rejects_flat_collisions_with_overwrite(
     assert not (output_dir / "Movie.png").exists()
 
 
-def test_installed_command_documents_batch_output_layouts() -> None:
-    """Expose every batch placement option, accepted layout, and both defaults."""
+def test_installed_command_documents_batch_readiness() -> None:
+    """Expose batch output-layout and readiness options with their limits."""
     completed_process = _run_cinebar(["batch", "--help"])
 
     assert completed_process.returncode == 0, completed_process.stderr
@@ -364,6 +420,38 @@ def test_installed_command_documents_batch_output_layouts() -> None:
         in (help_text)
     )
     assert "Default layout with this option." in help_text
+    assert "--settling-period SECONDS" in help_text
+    assert "--readiness-timeout SECONDS" in help_text
+    assert "Defaults to 60 seconds;" in help_text
+    assert "Defaults to 300 seconds." in help_text
+    assert "size and nanosecond modification time to remain unchanged" in help_text
+    assert "metadata stability is a heuristic, not proof that copying has finished" in (
+        help_text
+    )
+
+
+@pytest.mark.parametrize("option", ["--settling-period", "--readiness-timeout"])
+@pytest.mark.parametrize(
+    "duration",
+    ["not-a-duration", "nan", "inf", "-inf", "0", "-1"],
+)
+def test_installed_command_rejects_invalid_batch_readiness_durations(
+    tmp_path: Path,
+    option: str,
+    duration: str,
+) -> None:
+    """Reject malformed, non-finite, and non-positive batch durations."""
+    root = tmp_path / "sensitive-batch-root"
+
+    completed_process = _run_cinebar(["batch", str(root), option, duration])
+
+    _assert_installed_failure(
+        completed_process,
+        "invalid_argument",
+        "Invalid command-line arguments. Run 'cinebar --help' for usage.",
+        root,
+    )
+    assert completed_process.returncode == 1
 
 
 def _write_lossless_fixture(media_path: Path) -> None:

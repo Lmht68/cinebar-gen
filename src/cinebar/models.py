@@ -3,6 +3,8 @@
 from dataclasses import dataclass
 from pathlib import Path
 
+from .errors import FailureCategory
+
 
 @dataclass(frozen=True, slots=True)
 class ProcessingResult:
@@ -31,3 +33,29 @@ class ProcessingResult:
             raise ValueError("output_width must equal decoded_frame_count.")
         if self.output_height <= 0:
             raise ValueError("output_height must be positive.")
+
+
+@dataclass(frozen=True, slots=True)
+class BatchFailure:
+    """Describe one source that could not complete batch processing.
+
+    Args:
+        source_path: Initial source path that did not complete.
+        category: Stable reason the source did not complete.
+    """
+
+    source_path: Path
+    category: FailureCategory
+
+
+@dataclass(frozen=True, slots=True)
+class BatchProcessingResult:
+    """Describe successful and unavailable sources from one completed batch.
+
+    Args:
+        completed: Published barcode results in processing order.
+        failures: Source failures in observation order.
+    """
+
+    completed: tuple[ProcessingResult, ...]
+    failures: tuple[BatchFailure, ...]

@@ -14,6 +14,7 @@ class FailureCategory(StrEnum):
     INPUT_UNREADABLE = "input_unreadable"
     ROOT_NOT_FOUND = "root_not_found"
     ROOT_UNREADABLE = "root_unreadable"
+    READINESS_TIMEOUT = "readiness_timeout"
     NO_VIDEO_STREAM = "no_video_stream"
     ZERO_FRAMES = "zero_frames"
     DECODE_FAILED = "decode_failed"
@@ -49,6 +50,9 @@ _FAILURE_MESSAGES: dict[FailureCategory, str] = {
     ),
     FailureCategory.ROOT_UNREADABLE: (
         "Batch root is not a readable directory. Check its permissions and file type."
+    ),
+    FailureCategory.READINESS_TIMEOUT: (
+        "Input media did not become ready before the batch readiness timeout."
     ),
     FailureCategory.NO_VIDEO_STREAM: (
         "Input media has no usable video stream. Choose a supported video file."

@@ -113,6 +113,10 @@ from cinebar.progress import ProgressTracker
             "Distinct input media files map to the same barcode output.",
         ),
         (
+            FailureCategory.READINESS_TIMEOUT,
+            "Input media did not become ready before the batch readiness timeout.",
+        ),
+        (
             FailureCategory.INTERRUPTED,
             "Processing was interrupted; no new barcode was published.",
         ),
