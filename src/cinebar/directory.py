@@ -4,11 +4,12 @@ import math
 import os
 import stat
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
 from os.path import abspath, normcase
 from pathlib import Path
 from stat import S_ISDIR, S_ISREG
+from tempfile import NamedTemporaryFile
 from time import monotonic, sleep
 from typing import Protocol
 
@@ -16,7 +17,13 @@ from .crop import CropMode, CropSelection
 from .errors import CinebarError, FailureCategory
 from .models import BatchFailure, BatchProcessingResult, ProcessingResult
 from .processor import SingleFileProcessor
-from .progress import ProgressReporter
+from .progress import (
+    PhaseProgress,
+    ProcessingCompleted,
+    ProgressPhase,
+    ProgressReporter,
+    ProgressState,
+)
 
 _VIDEO_SUFFIXES = frozenset(
     {
@@ -106,7 +113,7 @@ class GenerationSettings:
     overwrite: bool = False
     output_dir: Path | None = None
     output_layout: OutputLayout | None = None
-    settling_period_seconds: float = 5.0
+    settling_period_seconds: float = 60.0
     readiness_timeout_seconds: float = 300.0
 
     def __post_init__(self) -> None:
@@ -142,6 +149,77 @@ class _SourceVersion:
     normalized_path: str
     byte_size: int
     modification_time_ns: int
+
+
+def _observe_source_version(source_version: _SourceVersion) -> _SourceVersion:
+    """Observe one readable regular source without following links."""
+    try:
+        source_status = source_version.source_path.stat(follow_symlinks=False)
+    except FileNotFoundError:
+        raise CinebarError(FailureCategory.INPUT_NOT_FOUND) from None
+    except OSError:
+        raise CinebarError(FailureCategory.INPUT_UNREADABLE) from None
+
+    if _is_reparse_point(source_status) or not S_ISREG(source_status.st_mode):
+        raise CinebarError(FailureCategory.INPUT_UNREADABLE)
+
+    return _SourceVersion(
+        source_path=source_version.source_path,
+        normalized_path=source_version.normalized_path,
+        byte_size=source_status.st_size,
+        modification_time_ns=source_status.st_mtime_ns,
+    )
+
+
+def _ensure_output_path_is_available(output_path: Path) -> None:
+    """Reject an existing final-path entry without resolving symlinks."""
+    try:
+        output_path.lstat()
+    except FileNotFoundError:
+        return
+    except OSError:
+        raise CinebarError(FailureCategory.OUTPUT_WRITE_FAILED) from None
+    raise CinebarError(FailureCategory.OUTPUT_EXISTS)
+
+
+def _reserve_unpublished_output(output_path: Path) -> Path:
+    """Reserve one hidden unpublished output on the final filesystem."""
+    try:
+        with NamedTemporaryFile(
+            delete=False,
+            dir=output_path.parent,
+            prefix=f".{output_path.name}.",
+            suffix=".unpublished",
+        ) as unpublished_output:
+            return Path(unpublished_output.name)
+    except OSError:
+        raise CinebarError(FailureCategory.OUTPUT_WRITE_FAILED) from None
+
+
+def _publish_unpublished_output(
+    unpublished_path: Path,
+    output_path: Path,
+    *,
+    overwrite: bool,
+) -> None:
+    """Atomically make a complete unpublished output visible at its final path."""
+    try:
+        if overwrite:
+            os.replace(unpublished_path, output_path)
+        else:
+            os.link(unpublished_path, output_path)
+    except FileExistsError:
+        raise CinebarError(FailureCategory.OUTPUT_EXISTS) from None
+    except OSError:
+        raise CinebarError(FailureCategory.OUTPUT_WRITE_FAILED) from None
+
+
+def _remove_unpublished_output(unpublished_path: Path) -> None:
+    """Remove one unpublished output artifact when it remains reserved."""
+    try:
+        unpublished_path.unlink(missing_ok=True)
+    except OSError:
+        raise CinebarError(FailureCategory.OUTPUT_WRITE_FAILED) from None
 
 
 @dataclass(slots=True)
@@ -359,32 +437,13 @@ class DirectoryProcessor:
             for pending_source in due_sources:
                 source_path = pending_source.source_version.source_path
                 try:
-                    current_status = source_path.stat(follow_symlinks=False)
-                except FileNotFoundError:
-                    failures.append(
-                        BatchFailure(source_path, FailureCategory.INPUT_NOT_FOUND)
+                    current_version = _observe_source_version(
+                        pending_source.source_version
                     )
-                    continue
-                except OSError:
-                    failures.append(
-                        BatchFailure(source_path, FailureCategory.INPUT_UNREADABLE)
-                    )
+                except CinebarError as error:
+                    failures.append(BatchFailure(source_path, error.category))
                     continue
 
-                if _is_reparse_point(current_status) or not S_ISREG(
-                    current_status.st_mode
-                ):
-                    failures.append(
-                        BatchFailure(source_path, FailureCategory.INPUT_UNREADABLE)
-                    )
-                    continue
-
-                current_version = _SourceVersion(
-                    source_path=source_path,
-                    normalized_path=pending_source.source_version.normalized_path,
-                    byte_size=current_status.st_size,
-                    modification_time_ns=current_status.st_mtime_ns,
-                )
                 if current_version == pending_source.source_version:
                     ready_sources.append(pending_source)
                     continue
@@ -395,17 +454,114 @@ class DirectoryProcessor:
 
             pending_sources = next_pending_sources
             for pending_source in ready_sources:
-                completed.append(
-                    self._barcode_generator.process(
-                        media_path=pending_source.source_version.source_path,
-                        output_path=pending_source.output_path,
+                source_path = pending_source.source_version.source_path
+                output_path = pending_source.output_path
+                if not settings.overwrite:
+                    _ensure_output_path_is_available(output_path)
+                unpublished_path = _reserve_unpublished_output(output_path)
+                buffered_events: list[PhaseProgress | ProcessingCompleted] = []
+                attempt_error: BaseException | None = None
+                attempt_progress_reporter: ProgressReporter | None = None
+
+                if progress_reporter is not None:
+
+                    def buffer_attempt_progress(
+                        event: PhaseProgress | ProcessingCompleted,
+                        *,
+                        attempt_events: list[PhaseProgress | ProcessingCompleted] = (
+                            buffered_events
+                        ),
+                        reporter: ProgressReporter = progress_reporter,
+                    ) -> None:
+                        if isinstance(event, ProcessingCompleted) or (
+                            isinstance(event, PhaseProgress)
+                            and event.phase is ProgressPhase.OUTPUT_PUBLICATION
+                        ):
+                            attempt_events.append(event)
+                            return
+                        reporter(event)
+
+                    attempt_progress_reporter = buffer_attempt_progress
+
+                try:
+                    try:
+                        current_version = _observe_source_version(
+                            pending_source.source_version
+                        )
+                    except CinebarError as error:
+                        failures.append(BatchFailure(source_path, error.category))
+                        continue
+
+                    if current_version != pending_source.source_version:
+                        pending_source.source_version = current_version
+                        pending_source.baseline_observed_at = self._clock()
+                        pending_sources.append(pending_source)
+                        continue
+
+                    unpublished_result = self._barcode_generator.process(
+                        media_path=source_path,
+                        output_path=unpublished_path,
                         height=settings.height,
                         workers=settings.workers,
-                        overwrite=settings.overwrite,
+                        overwrite=True,
                         crop=settings.crop,
-                        progress_reporter=progress_reporter,
+                        progress_reporter=attempt_progress_reporter,
                     )
-                )
+                    published_result = replace(
+                        unpublished_result,
+                        output_path=output_path,
+                    )
+
+                    if progress_reporter is not None:
+                        for event in buffered_events:
+                            if (
+                                isinstance(event, PhaseProgress)
+                                and event.state is not ProgressState.COMPLETED
+                            ):
+                                progress_reporter(event)
+
+                    try:
+                        current_version = _observe_source_version(
+                            pending_source.source_version
+                        )
+                    except CinebarError as error:
+                        failures.append(BatchFailure(source_path, error.category))
+                        continue
+
+                    if current_version != pending_source.source_version:
+                        pending_source.source_version = current_version
+                        pending_source.baseline_observed_at = self._clock()
+                        pending_sources.append(pending_source)
+                        continue
+
+                    _publish_unpublished_output(
+                        unpublished_path,
+                        output_path,
+                        overwrite=settings.overwrite,
+                    )
+                    completed.append(published_result)
+
+                    if progress_reporter is not None:
+                        for event in buffered_events:
+                            if (
+                                isinstance(event, PhaseProgress)
+                                and event.state is ProgressState.COMPLETED
+                            ):
+                                progress_reporter(event)
+                            elif isinstance(event, ProcessingCompleted):
+                                progress_reporter(
+                                    replace(event, result=published_result)
+                                )
+                except BaseException as error:
+                    attempt_error = error
+                    raise
+                finally:
+                    try:
+                        _remove_unpublished_output(unpublished_path)
+                    except CinebarError as cleanup_error:
+                        if attempt_error is None:
+                            raise
+                        attempt_error.add_note(str(cleanup_error))
 
         return BatchProcessingResult(
             completed=tuple(completed),

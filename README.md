@@ -36,7 +36,9 @@ uv run cinebar movie.mp4 --output movie-barcode.png --workers 8 --crop none
 Batch mode recursively scans `ROOT` for case-insensitive `.avi`, `.m2ts`, `.m4v`, `.mkv`, `.mov`, `.mp4`, `.mpeg`, `.mpg`, `.mts`, `.ts`, `.webm`, and `.wmv` sources.
 It skips dot-prefixed and host-hidden entries, symlinks, and Windows reparse points.
 Each movie is generated one at a time, using the normal `--height`, `--workers`, `--crop`, and `--overwrite` options.
-Source files must already be stable before batch processing starts.
+Batch mode waits for each initially discovered source to keep its size and nanosecond modification time unchanged for the settling period, which defaults to 60 seconds.
+It rechecks that version immediately before and after generation, returning a changed regular source to settling while readiness time remains.
+Generation writes an unpublished same-directory artifact, so a final barcode remains absent or unchanged until atomic publication.
 
 Without an output directory, each barcode is beside its source at `<source parent>/<stem>.cinebar.png`.
 

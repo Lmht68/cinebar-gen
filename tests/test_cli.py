@@ -319,7 +319,6 @@ def test_installed_command_defaults_output_directory_to_mirrored_layout(
             "none",
             "--settling-period",
             "0.01",
-            "--overwrite",
         ]
     )
 
@@ -332,6 +331,14 @@ def test_installed_command_defaults_output_directory_to_mirrored_layout(
         3,
         RGB_COLORS,
     )
+    assert {
+        output_path.relative_to(output_dir)
+        for output_path in output_dir.rglob("*")
+        if output_path.is_file()
+    } == {
+        Path("Shelf A") / "Nested" / "Movie.One (2024).cinebar.png",
+        Path("Shelf B") / "Movie Two.cinebar.png",
+    }
 
 
 def test_installed_command_writes_explicit_flat_output_layout(tmp_path: Path) -> None:

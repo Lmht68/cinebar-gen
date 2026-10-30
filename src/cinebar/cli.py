@@ -119,11 +119,11 @@ def _build_batch_parser() -> _CinebarArgumentParser:
     parser.add_argument(
         "--settling-period",
         type=_positive_duration,
-        default=5.0,
+        default=60.0,
         metavar="SECONDS",
         help=(
             "Require size and nanosecond modification time to remain unchanged "
-            "across observations. Defaults to 5 seconds; metadata stability is "
+            "across observations. Defaults to 60 seconds; metadata stability is "
             "a heuristic, not proof that copying has finished."
         ),
     )
