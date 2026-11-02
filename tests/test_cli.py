@@ -276,6 +276,44 @@ def test_installed_command_returns_two_for_readiness_timeout(tmp_path: Path) -> 
     assert "Traceback" not in completed_process.stderr
 
 
+def test_installed_command_isolates_malformed_batch_video(
+    tmp_path: Path,
+) -> None:
+    """Publish a valid barcode after another batch source fails to decode."""
+    root = tmp_path / "library"
+    malformed_source = root / "Alpha.mkv"
+    valid_source = root / "Beta.mkv"
+    root.mkdir()
+    malformed_source.write_bytes(b"not a video")
+    _write_lossless_fixture(valid_source)
+
+    completed_process = _run_cinebar(
+        [
+            "batch",
+            str(root),
+            "--height",
+            "3",
+            "--workers",
+            "1",
+            "--crop",
+            "none",
+            "--settling-period",
+            "0.01",
+        ]
+    )
+
+    assert completed_process.returncode == 2
+    assert not malformed_source.with_name("Alpha.cinebar.png").exists()
+    assert _read_barcode(valid_source.with_name("Beta.cinebar.png")) == (
+        4,
+        3,
+        RGB_COLORS,
+    )
+    assert "ERROR [no_video_stream]" in completed_process.stderr
+    assert f"Source: {malformed_source}" in completed_process.stderr
+    assert "Traceback" not in completed_process.stderr
+
+
 def test_installed_command_reports_missing_batch_root_as_fatal(tmp_path: Path) -> None:
     """Keep initial root discovery failures fatal and traceback-free."""
     root = tmp_path / "sensitive-missing-library"
@@ -406,11 +444,42 @@ def test_installed_command_rejects_flat_collisions_with_overwrite(
         ]
     )
 
-    assert completed_process.returncode == 1
+    assert completed_process.returncode == 2
+    assert completed_process.stderr.count("ERROR [output_collision]") == 2
     assert f"Destination: {output_dir / 'Movie.png'}" in completed_process.stderr
-    assert f"- {first_source}" in completed_process.stderr
-    assert f"- {second_source}" in completed_process.stderr
+    assert f"Source: {first_source}" in completed_process.stderr
+    assert f"Source: {second_source}" in completed_process.stderr
     assert not (output_dir / "Movie.png").exists()
+
+
+def test_installed_command_skips_existing_batch_output_without_overwrite(
+    tmp_path: Path,
+) -> None:
+    """Keep an existing mapped output without decoding the source."""
+    root = tmp_path / "library"
+    source = root / "Movie.mkv"
+    output_path = source.with_name("Movie.cinebar.png")
+    root.mkdir()
+    source.write_bytes(b"not a video")
+    output_path.write_bytes(b"previous barcode")
+
+    completed_process = _run_cinebar(
+        [
+            "batch",
+            str(root),
+            "--settling-period",
+            "0.01",
+        ]
+    )
+
+    assert completed_process.returncode == 0, completed_process.stderr
+    assert (
+        "INFO Skipped existing mapped output without verifying source or "
+        "generation settings."
+    ) in completed_process.stderr
+    assert f"Source: {source}" in completed_process.stderr
+    assert f"Destination: {output_path}" in completed_process.stderr
+    assert output_path.read_bytes() == b"previous barcode"
 
 
 def test_installed_command_documents_batch_readiness() -> None:

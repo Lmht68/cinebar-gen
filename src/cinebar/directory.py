@@ -15,7 +15,7 @@ from typing import Protocol
 
 from .crop import CropMode, CropSelection
 from .errors import CinebarError, FailureCategory
-from .models import BatchFailure, BatchProcessingResult, ProcessingResult
+from .models import BatchFailure, BatchProcessingResult, BatchSkip, ProcessingResult
 from .processor import SingleFileProcessor
 from .progress import (
     PhaseProgress,
@@ -74,12 +74,6 @@ def _is_within_directory(path: Path, directory: Path, *, strict: bool) -> bool:
         )
     except ValueError:
         return False
-
-
-def _path_sort_key(path: Path) -> tuple[str, str]:
-    """Return a stable normalized and absolute path sort key."""
-    absolute_path = abspath(path)
-    return (normcase(absolute_path), absolute_path)
 
 
 class OutputLayout(StrEnum):
@@ -151,6 +145,38 @@ class _SourceVersion:
     modification_time_ns: int
 
 
+@dataclass(frozen=True, slots=True)
+class _ProcessingIdentity:
+    """Identify one source version and configured generation request."""
+
+    normalized_source_path: str
+    byte_size: int
+    modification_time_ns: int
+    normalized_output_path: str
+    height: int
+    workers: int | None
+    crop: CropSelection
+    overwrite: bool
+
+
+def _processing_identity(
+    source_version: _SourceVersion,
+    output_path: Path,
+    settings: GenerationSettings,
+) -> _ProcessingIdentity:
+    """Return the invocation-local identity for one generation request."""
+    return _ProcessingIdentity(
+        normalized_source_path=source_version.normalized_path,
+        byte_size=source_version.byte_size,
+        modification_time_ns=source_version.modification_time_ns,
+        normalized_output_path=normcase(abspath(output_path)),
+        height=settings.height,
+        workers=settings.workers,
+        crop=settings.crop,
+        overwrite=settings.overwrite,
+    )
+
+
 def _observe_source_version(source_version: _SourceVersion) -> _SourceVersion:
     """Observe one readable regular source without following links."""
     try:
@@ -171,15 +197,15 @@ def _observe_source_version(source_version: _SourceVersion) -> _SourceVersion:
     )
 
 
-def _ensure_output_path_is_available(output_path: Path) -> None:
-    """Reject an existing final-path entry without resolving symlinks."""
+def _output_path_exists(output_path: Path) -> bool:
+    """Return whether any final-path entry exists without resolving links."""
     try:
         output_path.lstat()
     except FileNotFoundError:
-        return
+        return False
     except OSError:
         raise CinebarError(FailureCategory.OUTPUT_WRITE_FAILED) from None
-    raise CinebarError(FailureCategory.OUTPUT_EXISTS)
+    return True
 
 
 def _reserve_unpublished_output(output_path: Path) -> Path:
@@ -268,6 +294,27 @@ class DirectoryProcessor:
         self._barcode_generator = barcode_generator or SingleFileProcessor()
         self._clock = clock
         self._wait = wait
+        self._observed_identities: set[_ProcessingIdentity] = set()
+
+    def _queue_changed_source_version(
+        self,
+        pending_source: _PendingSource,
+        current_version: _SourceVersion,
+        settings: GenerationSettings,
+        observed_at: float,
+    ) -> bool:
+        """Queue an unobserved source version for a fresh settling period."""
+        processing_identity = _processing_identity(
+            current_version,
+            pending_source.output_path,
+            settings,
+        )
+        if processing_identity in self._observed_identities:
+            return False
+        self._observed_identities.add(processing_identity)
+        pending_source.source_version = current_version
+        pending_source.baseline_observed_at = observed_at
+        return True
 
     def process_batch(
         self,
@@ -301,8 +348,9 @@ class DirectoryProcessor:
             else None
         )
         source_versions = _discover_sources(root, excluded_directory)
-        output_sources: dict[str, tuple[Path, list[Path]]] = {}
-        plans: list[tuple[_SourceVersion, Path]] = []
+        output_sources: dict[str, tuple[Path, dict[str, Path]]] = {}
+        plans: list[tuple[_SourceVersion, Path, _ProcessingIdentity]] = []
+        discovered_identities: set[_ProcessingIdentity] = set()
         for source_version in source_versions:
             source = source_version.source_path
             if settings.output_dir is None:
@@ -318,65 +366,64 @@ class DirectoryProcessor:
             output_key = normcase(abspath(output_path))
             source_paths = output_sources.setdefault(
                 output_key,
-                (Path(abspath(output_path)), []),
+                (Path(abspath(output_path)), {}),
             )[1]
-            source_paths.append(Path(abspath(source)))
-            plans.append((source_version, output_path))
-
-        collisions = [
-            (destination, source_paths)
-            for destination, source_paths in output_sources.values()
-            if len(source_paths) >= 2
-        ]
-        if collisions:
-            safe_detail = "\n\n".join(
-                "\n".join(
-                    [
-                        f"Destination: {destination}",
-                        "Conflicting inputs:",
-                        *(
-                            f"- {source}"
-                            for source in sorted(source_paths, key=_path_sort_key)
-                        ),
-                    ]
-                )
-                for destination, source_paths in sorted(
-                    collisions,
-                    key=lambda group: _path_sort_key(group[0]),
-                )
+            source_paths.setdefault(
+                source_version.normalized_path,
+                Path(abspath(source)),
             )
-            raise CinebarError(FailureCategory.OUTPUT_COLLISION, safe_detail)
-
-        destination_parents: dict[str, Path] = {}
-        for _, output_path in plans:
-            destination_parents.setdefault(
-                normcase(abspath(output_path.parent)),
-                output_path.parent,
+            processing_identity = _processing_identity(
+                source_version,
+                output_path,
+                settings,
             )
-        try:
-            for output_parent in sorted(
-                destination_parents.values(),
-                key=_path_sort_key,
+            if (
+                processing_identity in self._observed_identities
+                or processing_identity in discovered_identities
             ):
-                output_parent.mkdir(parents=True, exist_ok=True)
-        except OSError:
-            raise CinebarError(FailureCategory.OUTPUT_WRITE_FAILED) from None
+                continue
+            discovered_identities.add(processing_identity)
+            plans.append((source_version, output_path, processing_identity))
 
-        if not plans:
-            return BatchProcessingResult(completed=(), failures=())
-
+        collision_destinations = {
+            output_key: destination
+            for output_key, (destination, source_paths) in output_sources.items()
+            if len(source_paths) >= 2
+        }
+        completed: list[ProcessingResult] = []
+        skipped: list[BatchSkip] = []
+        failures: list[BatchFailure] = []
         readiness_started_at = self._clock()
         readiness_deadline = readiness_started_at + settings.readiness_timeout_seconds
-        pending_sources = [
-            _PendingSource(
-                source_version=source_version,
-                output_path=output_path,
-                baseline_observed_at=readiness_started_at,
+        pending_sources: list[_PendingSource] = []
+        for source_version, output_path, processing_identity in plans:
+            collision_destination = collision_destinations.get(
+                normcase(abspath(output_path))
             )
-            for source_version, output_path in plans
-        ]
-        completed: list[ProcessingResult] = []
-        failures: list[BatchFailure] = []
+            self._observed_identities.add(processing_identity)
+            if collision_destination is not None:
+                failures.append(
+                    BatchFailure(
+                        source_version.source_path,
+                        FailureCategory.OUTPUT_COLLISION,
+                        f"Destination: {collision_destination}",
+                    )
+                )
+                continue
+            pending_sources.append(
+                _PendingSource(
+                    source_version=source_version,
+                    output_path=output_path,
+                    baseline_observed_at=readiness_started_at,
+                )
+            )
+
+        if not pending_sources:
+            return BatchProcessingResult(
+                completed=tuple(completed),
+                skipped=tuple(skipped),
+                failures=tuple(failures),
+            )
 
         while pending_sources:
             current_time = self._clock()
@@ -441,24 +488,30 @@ class DirectoryProcessor:
                         pending_source.source_version
                     )
                 except CinebarError as error:
-                    failures.append(BatchFailure(source_path, error.category))
+                    if error.category is FailureCategory.INTERRUPTED:
+                        raise
+                    failures.append(
+                        BatchFailure(source_path, error.category, error.safe_detail)
+                    )
                     continue
 
                 if current_version == pending_source.source_version:
                     ready_sources.append(pending_source)
                     continue
 
-                pending_source.source_version = current_version
-                pending_source.baseline_observed_at = current_time
-                next_pending_sources.append(pending_source)
+                if self._queue_changed_source_version(
+                    pending_source,
+                    current_version,
+                    settings,
+                    current_time,
+                ):
+                    next_pending_sources.append(pending_source)
 
             pending_sources = next_pending_sources
             for pending_source in ready_sources:
                 source_path = pending_source.source_version.source_path
                 output_path = pending_source.output_path
-                if not settings.overwrite:
-                    _ensure_output_path_is_available(output_path)
-                unpublished_path = _reserve_unpublished_output(output_path)
+                unpublished_path: Path | None = None
                 buffered_events: list[PhaseProgress | ProcessingCompleted] = []
                 attempt_error: BaseException | None = None
                 attempt_progress_reporter: ProgressReporter | None = None
@@ -484,18 +537,28 @@ class DirectoryProcessor:
                     attempt_progress_reporter = buffer_attempt_progress
 
                 try:
-                    try:
-                        current_version = _observe_source_version(
-                            pending_source.source_version
-                        )
-                    except CinebarError as error:
-                        failures.append(BatchFailure(source_path, error.category))
+                    if not settings.overwrite and _output_path_exists(output_path):
+                        skipped.append(BatchSkip(source_path, output_path))
                         continue
+                    try:
+                        output_path.parent.mkdir(parents=True, exist_ok=True)
+                    except OSError:
+                        raise CinebarError(
+                            FailureCategory.OUTPUT_WRITE_FAILED
+                        ) from None
+                    unpublished_path = _reserve_unpublished_output(output_path)
 
+                    current_version = _observe_source_version(
+                        pending_source.source_version
+                    )
                     if current_version != pending_source.source_version:
-                        pending_source.source_version = current_version
-                        pending_source.baseline_observed_at = self._clock()
-                        pending_sources.append(pending_source)
+                        if self._queue_changed_source_version(
+                            pending_source,
+                            current_version,
+                            settings,
+                            self._clock(),
+                        ):
+                            pending_sources.append(pending_source)
                         continue
 
                     unpublished_result = self._barcode_generator.process(
@@ -520,18 +583,17 @@ class DirectoryProcessor:
                             ):
                                 progress_reporter(event)
 
-                    try:
-                        current_version = _observe_source_version(
-                            pending_source.source_version
-                        )
-                    except CinebarError as error:
-                        failures.append(BatchFailure(source_path, error.category))
-                        continue
-
+                    current_version = _observe_source_version(
+                        pending_source.source_version
+                    )
                     if current_version != pending_source.source_version:
-                        pending_source.source_version = current_version
-                        pending_source.baseline_observed_at = self._clock()
-                        pending_sources.append(pending_source)
+                        if self._queue_changed_source_version(
+                            pending_source,
+                            current_version,
+                            settings,
+                            self._clock(),
+                        ):
+                            pending_sources.append(pending_source)
                         continue
 
                     _publish_unpublished_output(
@@ -552,19 +614,37 @@ class DirectoryProcessor:
                                 progress_reporter(
                                     replace(event, result=published_result)
                                 )
-                except BaseException as error:
+                except CinebarError as error:
+                    attempt_error = error
+                    if error.category is FailureCategory.INTERRUPTED:
+                        raise
+                    failures.append(
+                        BatchFailure(source_path, error.category, error.safe_detail)
+                    )
+                except KeyboardInterrupt as error:
                     attempt_error = error
                     raise
                 finally:
-                    try:
-                        _remove_unpublished_output(unpublished_path)
-                    except CinebarError as cleanup_error:
-                        if attempt_error is None:
-                            raise
-                        attempt_error.add_note(str(cleanup_error))
+                    if unpublished_path is not None:
+                        try:
+                            _remove_unpublished_output(unpublished_path)
+                        except CinebarError as cleanup_error:
+                            if cleanup_error.category is FailureCategory.INTERRUPTED:
+                                raise
+                            if attempt_error is None:
+                                failures.append(
+                                    BatchFailure(
+                                        source_path,
+                                        cleanup_error.category,
+                                        cleanup_error.safe_detail,
+                                    )
+                                )
+                            else:
+                                attempt_error.add_note(str(cleanup_error))
 
         return BatchProcessingResult(
             completed=tuple(completed),
+            skipped=tuple(skipped),
             failures=tuple(failures),
         )
 

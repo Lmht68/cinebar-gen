@@ -163,8 +163,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         argv: Optional command-line arguments excluding the program name.
 
     Returns:
-        Zero after publication, two after batch readiness failures, one after a
-        fatal failure, or 130 after interruption.
+        Zero after a completed batch, two after any batch candidate failure, one
+        after a fatal failure, or 130 after interruption.
     """
     freeze_support()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
@@ -199,12 +199,19 @@ def main(argv: Sequence[str] | None = None) -> int:
                 progress_reporter=renderer,
             )
             renderer.finish_line()
+            for skipped in batch_result.skipped:
+                LOGGER.info(
+                    "Skipped existing mapped output without verifying source or "
+                    "generation settings.\nSource: %s\nDestination: %s",
+                    skipped.source_path,
+                    skipped.output_path,
+                )
             if batch_result.failures:
                 for failure in batch_result.failures:
-                    failure_error = CinebarError(
-                        failure.category,
-                        f"Source: {failure.source_path}",
-                    )
+                    detail = f"Source: {failure.source_path}"
+                    if failure.safe_detail is not None:
+                        detail = f"{detail}\n{failure.safe_detail}"
+                    failure_error = CinebarError(failure.category, detail)
                     LOGGER.error(
                         "[%s] %s",
                         failure_error.category.value,

@@ -36,26 +36,43 @@ class ProcessingResult:
 
 
 @dataclass(frozen=True, slots=True)
+class BatchSkip:
+    """Describe one source skipped because its mapped output already exists.
+
+    Args:
+        source_path: Source path mapped to the existing output.
+        output_path: Existing destination that prevented processing.
+    """
+
+    source_path: Path
+    output_path: Path
+
+
+@dataclass(frozen=True, slots=True)
 class BatchFailure:
     """Describe one source that could not complete batch processing.
 
     Args:
         source_path: Initial source path that did not complete.
         category: Stable reason the source did not complete.
+        safe_detail: Optional safe detail explaining the failure.
     """
 
     source_path: Path
     category: FailureCategory
+    safe_detail: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class BatchProcessingResult:
-    """Describe successful and unavailable sources from one completed batch.
+    """Describe every outcome from one completed batch.
 
     Args:
         completed: Published barcode results in processing order.
+        skipped: Existing mapped outputs skipped in processing order.
         failures: Source failures in observation order.
     """
 
     completed: tuple[ProcessingResult, ...]
+    skipped: tuple[BatchSkip, ...]
     failures: tuple[BatchFailure, ...]

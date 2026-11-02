@@ -8,7 +8,7 @@ from .directory import (
     OutputLayout,
 )
 from .errors import CinebarError, FailureCategory
-from .models import BatchFailure, BatchProcessingResult, ProcessingResult
+from .models import BatchFailure, BatchProcessingResult, BatchSkip, ProcessingResult
 from .processor import SingleFileProcessor
 from .progress import (
     PhaseProgress,
@@ -24,6 +24,7 @@ __all__ = [
     "BarcodeGenerator",
     "BatchFailure",
     "BatchProcessingResult",
+    "BatchSkip",
     "CinebarError",
     "CropMode",
     "CropRectangle",

@@ -13,6 +13,7 @@ from cinebar import (
     BarcodeGenerator,
     BatchFailure,
     BatchProcessingResult,
+    BatchSkip,
     CinebarError,
     CropMode,
     DirectoryProcessor,
@@ -79,7 +80,7 @@ def test_directory_processor_returns_empty_batch_result_with_default_readiness(
 
     assert settings.settling_period_seconds == 60.0
     assert settings.readiness_timeout_seconds == 300.0
-    assert batch_result == BatchProcessingResult(completed=(), failures=())
+    assert batch_result == BatchProcessingResult(completed=(), skipped=(), failures=())
 
 
 def _with_settling_period(value: object) -> GenerationSettings:
@@ -215,8 +216,20 @@ class _FailingBarcodeGenerator(_WritingBarcodeGenerator):
         crop: CropSelection = CropMode.AUTO,
         progress_reporter: ProgressReporter | None = None,
     ) -> ProcessingResult:
-        self.calls.append((media_path, output_path, height, workers, overwrite, crop))
-        raise CinebarError(FailureCategory.NO_VIDEO_STREAM)
+        if not self.calls:
+            self.calls.append(
+                (media_path, output_path, height, workers, overwrite, crop)
+            )
+            raise CinebarError(FailureCategory.NO_VIDEO_STREAM)
+        return super().process(
+            media_path,
+            output_path,
+            height,
+            workers,
+            overwrite,
+            crop,
+            progress_reporter,
+        )
 
 
 class _ChangesOtherSourceBarcodeGenerator(_WritingBarcodeGenerator):
@@ -325,6 +338,45 @@ class _MutatesSourceDuringGenerationBarcodeGenerator(_WritingBarcodeGenerator):
         )
 
 
+class _CyclesSourceVersionBarcodeGenerator(_WritingBarcodeGenerator):
+    def __init__(self, original_modification_time_ns: int) -> None:
+        super().__init__()
+        self._original_modification_time_ns = original_modification_time_ns
+
+    def process(
+        self,
+        media_path: Path,
+        output_path: Path,
+        height: int = 300,
+        workers: int | None = None,
+        overwrite: bool = False,
+        crop: CropSelection = CropMode.AUTO,
+        progress_reporter: ProgressReporter | None = None,
+    ) -> ProcessingResult:
+        processing_result = super().process(
+            media_path,
+            output_path,
+            height,
+            workers,
+            overwrite,
+            crop,
+            progress_reporter,
+        )
+        if len(self.calls) == 1:
+            media_path.write_bytes(b"new source")
+        elif len(self.calls) == 2:
+            media_path.write_bytes(b"old source")
+            source_status = media_path.stat()
+            os.utime(
+                media_path,
+                ns=(
+                    source_status.st_atime_ns,
+                    self._original_modification_time_ns,
+                ),
+            )
+        return processing_result
+
+
 class _RaisesAfterArtifactWriteBarcodeGenerator(_WritingBarcodeGenerator):
     def __init__(self, raised_error: BaseException) -> None:
         super().__init__()
@@ -374,7 +426,8 @@ class _CreatesFinalOutputDuringGenerationBarcodeGenerator(_WritingBarcodeGenerat
             crop,
             progress_reporter,
         )
-        self._create_final_output(self._output_path)
+        if len(self.calls) == 1:
+            self._create_final_output(self._output_path)
         return processing_result
 
 
@@ -681,6 +734,40 @@ def test_directory_processor_rechecks_source_changes_during_generation(
     assert not list(output_path.parent.glob(f".{output_path.name}.*.unpublished"))
 
 
+def test_directory_processor_does_not_requeue_observed_source_version_cycle(
+    tmp_path: Path,
+) -> None:
+    """Suppress an old source version observed again after generation."""
+    root = tmp_path / "library"
+    source = root / "Movie.mkv"
+    output_path = source.with_name("Movie.cinebar.png")
+    root.mkdir()
+    source.write_bytes(b"old source")
+    original_modification_time_ns = source.stat().st_mtime_ns
+    clock = _ControlledClock()
+    barcode_generator = _CyclesSourceVersionBarcodeGenerator(
+        original_modification_time_ns
+    )
+
+    batch_result = _directory_processor(barcode_generator, clock).process_batch(
+        root,
+        GenerationSettings(
+            settling_period_seconds=5.0,
+            readiness_timeout_seconds=20.0,
+        ),
+    )
+
+    assert batch_result == BatchProcessingResult(
+        completed=(),
+        skipped=(),
+        failures=(),
+    )
+    assert [call[0] for call in barcode_generator.calls] == [source, source]
+    assert source.read_bytes() == b"old source"
+    assert not output_path.exists()
+    assert clock.wait_durations == [5.0, 5.0]
+
+
 def test_directory_processor_holds_completion_until_atomic_publication(
     tmp_path: Path,
 ) -> None:
@@ -727,15 +814,18 @@ def test_directory_processor_holds_completion_until_atomic_publication(
     assert output_path.read_bytes() == b"current source"
 
 
-def test_directory_processor_reports_source_disappears_during_generation(
+def test_directory_processor_isolates_source_disappearance_during_generation(
     tmp_path: Path,
 ) -> None:
-    """Report a source removed after generation without publishing its artifact."""
+    """Publish another source after a candidate disappears during generation."""
     root = tmp_path / "library"
-    source = root / "Movie.mkv"
-    output_path = source.with_name("Movie.cinebar.png")
+    disappeared_source = root / "Alpha.mkv"
+    successful_source = root / "Beta.mkv"
+    disappeared_output = disappeared_source.with_name("Alpha.cinebar.png")
+    successful_output = successful_source.with_name("Beta.cinebar.png")
     root.mkdir()
-    source.write_bytes(b"source")
+    disappeared_source.write_bytes(b"disappearing source")
+    successful_source.write_bytes(b"successful source")
     clock = _ControlledClock()
     barcode_generator = _MutatesSourceDuringGenerationBarcodeGenerator(
         lambda changing_source: changing_source.unlink()
@@ -749,15 +839,23 @@ def test_directory_processor_reports_source_disappears_during_generation(
         ),
     )
 
-    assert batch_result.completed == ()
-    assert batch_result.failures == (
-        BatchFailure(source, FailureCategory.INPUT_NOT_FOUND),
+    assert tuple(result.output_path for result in batch_result.completed) == (
+        successful_output,
     )
-    assert [call[0] for call in barcode_generator.calls] == [source]
-    assert not source.exists()
-    assert not output_path.exists()
+    assert batch_result.failures == (
+        BatchFailure(disappeared_source, FailureCategory.INPUT_NOT_FOUND),
+    )
+    assert [call[0] for call in barcode_generator.calls] == [
+        disappeared_source,
+        successful_source,
+    ]
+    assert not disappeared_source.exists()
+    assert not disappeared_output.exists()
+    assert successful_output.read_bytes() == b"successful source"
     assert clock.wait_durations == [5.0]
-    assert not list(output_path.parent.glob(f".{output_path.name}.*.unpublished"))
+    assert not list(
+        disappeared_output.parent.glob(f".{disappeared_output.name}.*.unpublished")
+    )
 
 
 def test_directory_processor_source_is_replaced_during_generation(
@@ -1230,6 +1328,200 @@ def test_directory_processor_creates_mirrored_destination_parents(
     assert expected_output.read_bytes() == b"Movie.mkv"
 
 
+def test_directory_processor_isolates_destination_parent_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Publish writable destinations after one destination parent fails."""
+    root = tmp_path / "library"
+    failed_source = root / "Bad" / "Alpha.mkv"
+    successful_source = root / "Good" / "Beta.mkv"
+    output_dir = tmp_path / "barcodes"
+    failed_source.parent.mkdir(parents=True)
+    successful_source.parent.mkdir(parents=True)
+    failed_source.write_bytes(b"failed source")
+    successful_source.write_bytes(b"successful source")
+    failed_output = output_dir / "Bad" / "Alpha.cinebar.png"
+    successful_output = output_dir / "Good" / "Beta.cinebar.png"
+    original_mkdir = Path.mkdir
+
+    def rejecting_mkdir(
+        path: Path,
+        mode: int = 0o777,
+        parents: bool = False,
+        exist_ok: bool = False,
+    ) -> None:
+        if path == failed_output.parent:
+            raise PermissionError
+        original_mkdir(path, mode=mode, parents=parents, exist_ok=exist_ok)
+
+    monkeypatch.setattr(Path, "mkdir", rejecting_mkdir)
+    barcode_generator = _WritingBarcodeGenerator()
+
+    batch_result = _directory_processor(barcode_generator).process_batch(
+        root,
+        GenerationSettings(output_dir=output_dir),
+    )
+
+    assert tuple(result.output_path for result in batch_result.completed) == (
+        successful_output,
+    )
+    assert batch_result.failures == (
+        BatchFailure(failed_source, FailureCategory.OUTPUT_WRITE_FAILED),
+    )
+    assert [call[0] for call in barcode_generator.calls] == [successful_source]
+    assert not failed_output.exists()
+    assert successful_output.read_bytes() == b"Beta.mkv"
+
+
+def test_directory_processor_skips_existing_mapped_output_without_overwrite(
+    tmp_path: Path,
+) -> None:
+    """Skip an existing output without invoking the barcode generator."""
+    root = tmp_path / "library"
+    source = root / "Movie.mkv"
+    output_path = source.with_name("Movie.cinebar.png")
+    root.mkdir()
+    source.write_bytes(b"source")
+    output_path.write_bytes(b"previous barcode")
+    barcode_generator = _WritingBarcodeGenerator()
+
+    batch_result = _directory_processor(barcode_generator).process_batch(root)
+
+    assert batch_result == BatchProcessingResult(
+        completed=(),
+        skipped=(BatchSkip(source, output_path),),
+        failures=(),
+    )
+    assert barcode_generator.calls == []
+    assert output_path.read_bytes() == b"previous barcode"
+
+
+def test_directory_processor_replaces_one_source_version_once_per_instance(
+    tmp_path: Path,
+) -> None:
+    """Generate an unchanged source version once when overwrite is enabled."""
+    root = tmp_path / "library"
+    source = root / "Movie.mkv"
+    output_path = source.with_name("Movie.cinebar.png")
+    root.mkdir()
+    source.write_bytes(b"source")
+    output_path.write_bytes(b"previous barcode")
+    barcode_generator = _WritingBarcodeGenerator()
+    directory_processor = _directory_processor(barcode_generator)
+    settings = GenerationSettings(overwrite=True)
+
+    first_result = directory_processor.process_batch(root, settings)
+    second_result = directory_processor.process_batch(root, settings)
+
+    assert tuple(result.output_path for result in first_result.completed) == (
+        output_path,
+    )
+    assert second_result == BatchProcessingResult(
+        completed=(),
+        skipped=(),
+        failures=(),
+    )
+    assert [call[0] for call in barcode_generator.calls] == [source]
+    assert output_path.read_bytes() == b"Movie.mkv"
+
+
+def test_directory_processor_does_not_retry_failed_identity_until_new_instance(
+    tmp_path: Path,
+) -> None:
+    """Leave a failed source terminal for one processor instance."""
+    root = tmp_path / "library"
+    source = root / "Movie.mkv"
+    output_path = source.with_name("Movie.cinebar.png")
+    root.mkdir()
+    source.write_bytes(b"source")
+    failed_generator = _FailingBarcodeGenerator()
+    directory_processor = _directory_processor(failed_generator)
+
+    failed_result = directory_processor.process_batch(root)
+    repeated_result = directory_processor.process_batch(root)
+    retried_generator = _WritingBarcodeGenerator()
+    retried_result = _directory_processor(retried_generator).process_batch(root)
+
+    assert failed_result.failures == (
+        BatchFailure(source, FailureCategory.NO_VIDEO_STREAM),
+    )
+    assert repeated_result == BatchProcessingResult(
+        completed=(),
+        skipped=(),
+        failures=(),
+    )
+    assert tuple(result.output_path for result in retried_result.completed) == (
+        output_path,
+    )
+    assert [call[0] for call in failed_generator.calls] == [source]
+    assert [call[0] for call in retried_generator.calls] == [source]
+    assert output_path.read_bytes() == b"Movie.mkv"
+
+
+@pytest.mark.parametrize(
+    "change_source",
+    [_change_source_size, _change_source_modification_time],
+    ids=["size", "modification-time"],
+)
+def test_directory_processor_retries_changed_source_metadata(
+    tmp_path: Path,
+    change_source: Callable[[Path], None],
+) -> None:
+    """Treat changed source metadata as a new source version."""
+    root = tmp_path / "library"
+    source = root / "Movie.mkv"
+    output_path = source.with_name("Movie.cinebar.png")
+    root.mkdir()
+    source.write_bytes(b"source")
+    barcode_generator = _FailingBarcodeGenerator()
+    directory_processor = _directory_processor(barcode_generator)
+
+    failed_result = directory_processor.process_batch(root)
+    change_source(source)
+    completed_result = directory_processor.process_batch(root)
+
+    assert failed_result.failures == (
+        BatchFailure(source, FailureCategory.NO_VIDEO_STREAM),
+    )
+    assert tuple(result.output_path for result in completed_result.completed) == (
+        output_path,
+    )
+    assert [call[0] for call in barcode_generator.calls] == [source, source]
+    assert output_path.read_bytes() == b"Movie.mkv"
+
+
+def test_directory_processor_processes_new_destination_for_observed_source(
+    tmp_path: Path,
+) -> None:
+    """Generate again when a source maps to a different destination."""
+    root = tmp_path / "library"
+    source = root / "Movie.mkv"
+    first_output = source.with_name("Movie.cinebar.png")
+    output_dir = tmp_path / "barcodes"
+    second_output = output_dir / "Movie.cinebar.png"
+    root.mkdir()
+    source.write_bytes(b"source")
+    barcode_generator = _WritingBarcodeGenerator()
+    directory_processor = _directory_processor(barcode_generator)
+
+    first_result = directory_processor.process_batch(root)
+    second_result = directory_processor.process_batch(
+        root,
+        GenerationSettings(output_dir=output_dir),
+    )
+
+    assert tuple(result.output_path for result in first_result.completed) == (
+        first_output,
+    )
+    assert tuple(result.output_path for result in second_result.completed) == (
+        second_output,
+    )
+    assert [call[0] for call in barcode_generator.calls] == [source, source]
+    assert first_output.read_bytes() == b"Movie.mkv"
+    assert second_output.read_bytes() == b"Movie.mkv"
+
+
 def test_directory_processor_excludes_nested_output_directory(
     tmp_path: Path,
 ) -> None:
@@ -1416,6 +1708,43 @@ def test_directory_processor_preserves_source_stems_in_beside_input_names(
     )
 
 
+def test_directory_processor_isolates_collisions_from_unrelated_sources(
+    tmp_path: Path,
+) -> None:
+    """Publish a noncolliding source after collision failures."""
+    root = tmp_path / "library"
+    first_collision = root / "Alpha.mkv"
+    second_collision = root / "Alpha.mp4"
+    successful_source = root / "Beta.mkv"
+    root.mkdir()
+    first_collision.write_bytes(b"first collision")
+    second_collision.write_bytes(b"second collision")
+    successful_source.write_bytes(b"successful source")
+    barcode_generator = _WritingBarcodeGenerator()
+
+    batch_result = _directory_processor(barcode_generator).process_batch(root)
+
+    collision_destination = first_collision.with_name("Alpha.cinebar.png")
+    assert tuple(result.output_path for result in batch_result.completed) == (
+        successful_source.with_name("Beta.cinebar.png"),
+    )
+    assert batch_result.skipped == ()
+    assert batch_result.failures == (
+        BatchFailure(
+            first_collision,
+            FailureCategory.OUTPUT_COLLISION,
+            f"Destination: {os.path.abspath(collision_destination)}",
+        ),
+        BatchFailure(
+            second_collision,
+            FailureCategory.OUTPUT_COLLISION,
+            f"Destination: {os.path.abspath(collision_destination)}",
+        ),
+    )
+    assert [call[0] for call in barcode_generator.calls] == [successful_source]
+    assert not collision_destination.exists()
+
+
 @pytest.mark.parametrize(
     ("output_layout", "expected_filename"),
     [
@@ -1454,25 +1783,21 @@ def test_directory_processor_reports_same_stem_collisions_in_all_layouts(
             os.path.abspath(path),
         ),
     )
-    expected_detail = "\n".join(
-        [
-            f"Destination: {os.path.abspath(expected_destination)}",
-            "Conflicting inputs:",
-            *(f"- {os.path.abspath(source)}" for source in expected_sources),
-        ]
-    )
     barcode_generator = _WritingBarcodeGenerator()
 
-    with pytest.raises(CinebarError) as raised_error:
-        _directory_processor(barcode_generator).process_batch(root, settings)
+    batch_result = _directory_processor(barcode_generator).process_batch(root, settings)
 
-    assert raised_error.value.category is FailureCategory.OUTPUT_COLLISION
-    assert raised_error.value.args == (
-        FailureCategory.OUTPUT_COLLISION,
-        expected_detail,
-    )
-    assert str(raised_error.value) == (
-        f"Distinct input media files map to the same barcode output.\n{expected_detail}"
+    assert batch_result == BatchProcessingResult(
+        completed=(),
+        skipped=(),
+        failures=tuple(
+            BatchFailure(
+                source,
+                FailureCategory.OUTPUT_COLLISION,
+                f"Destination: {os.path.abspath(expected_destination)}",
+            )
+            for source in expected_sources
+        ),
     )
     assert barcode_generator.calls == []
 
@@ -1490,18 +1815,25 @@ def test_directory_processor_reports_flat_collisions_across_source_folders(
     first_source.write_bytes(b"first")
     second_source.write_bytes(b"second")
 
-    with pytest.raises(CinebarError) as raised_error:
-        _directory_processor(_WritingBarcodeGenerator()).process_batch(
-            root,
-            GenerationSettings(
-                output_dir=output_dir,
-                output_layout=OutputLayout.FLAT,
-            ),
-        )
+    batch_result = _directory_processor(_WritingBarcodeGenerator()).process_batch(
+        root,
+        GenerationSettings(
+            output_dir=output_dir,
+            output_layout=OutputLayout.FLAT,
+        ),
+    )
 
-    assert raised_error.value.category is FailureCategory.OUTPUT_COLLISION
-    assert f"Destination: {os.path.abspath(output_dir / 'Movie.png')}" in str(
-        raised_error.value
+    assert batch_result.failures == (
+        BatchFailure(
+            first_source,
+            FailureCategory.OUTPUT_COLLISION,
+            f"Destination: {os.path.abspath(output_dir / 'Movie.png')}",
+        ),
+        BatchFailure(
+            second_source,
+            FailureCategory.OUTPUT_COLLISION,
+            f"Destination: {os.path.abspath(output_dir / 'Movie.png')}",
+        ),
     )
 
 
@@ -1522,14 +1854,21 @@ def test_directory_processor_uses_host_case_rules_for_collision_keys(
     )
 
     if os.path.normcase("Movie.png") == os.path.normcase("movie.png"):
-        with pytest.raises(CinebarError) as raised_error:
-            _directory_processor(_WritingBarcodeGenerator()).process_batch(
-                root, settings
-            )
+        batch_result = _directory_processor(_WritingBarcodeGenerator()).process_batch(
+            root, settings
+        )
 
-        assert raised_error.value.category is FailureCategory.OUTPUT_COLLISION
-        assert f"Destination: {os.path.abspath(output_dir / 'Movie.png')}" in str(
-            raised_error.value
+        assert batch_result.failures == (
+            BatchFailure(
+                first_source,
+                FailureCategory.OUTPUT_COLLISION,
+                f"Destination: {os.path.abspath(output_dir / 'Movie.png')}",
+            ),
+            BatchFailure(
+                second_source,
+                FailureCategory.OUTPUT_COLLISION,
+                f"Destination: {os.path.abspath(output_dir / 'Movie.png')}",
+            ),
         )
     else:
         batch_result = _directory_processor(_WritingBarcodeGenerator()).process_batch(
@@ -1558,45 +1897,29 @@ def test_directory_processor_reports_every_collision_group_and_source(
         (root / "Alpha.cinebar.png", alpha_sources),
         (root / "Beta.cinebar.png", beta_sources),
     )
-    expected_detail = "\n\n".join(
-        "\n".join(
-            [
-                f"Destination: {os.path.abspath(destination)}",
-                "Conflicting inputs:",
-                *(
-                    f"- {os.path.abspath(source)}"
-                    for source in sorted(
-                        sources,
-                        key=lambda path: (
-                            os.path.normcase(os.path.abspath(path)),
-                            os.path.abspath(path),
-                        ),
-                    )
-                ),
-            ]
+    expected_failures = tuple(
+        BatchFailure(
+            source,
+            FailureCategory.OUTPUT_COLLISION,
+            f"Destination: {os.path.abspath(destination)}",
         )
-        for destination, sources in sorted(
-            collision_groups,
-            key=lambda group: (
-                os.path.normcase(os.path.abspath(group[0])),
-                os.path.abspath(group[0]),
+        for destination, sources in collision_groups
+        for source in sorted(
+            sources,
+            key=lambda path: (
+                os.path.normcase(os.path.abspath(path)),
+                os.path.abspath(path),
             ),
         )
     )
     barcode_generator = _WritingBarcodeGenerator()
 
-    with pytest.raises(CinebarError) as raised_error:
-        _directory_processor(barcode_generator).process_batch(
-            root,
-            GenerationSettings(overwrite=True),
-        )
-
-    assert raised_error.value.category is FailureCategory.OUTPUT_COLLISION
-    assert raised_error.value.args == (
-        FailureCategory.OUTPUT_COLLISION,
-        expected_detail,
+    batch_result = _directory_processor(barcode_generator).process_batch(
+        root,
+        GenerationSettings(overwrite=True),
     )
-    assert str(raised_error.value).endswith(expected_detail)
+
+    assert batch_result.failures == expected_failures
     assert barcode_generator.calls == []
 
 
@@ -1637,10 +1960,10 @@ def test_directory_processor_processes_one_movie_at_a_time(tmp_path: Path) -> No
     assert barcode_generator.completed_sources == [first_source, second_source]
 
 
-def test_directory_processor_stops_after_first_generator_failure(
+def test_directory_processor_isolates_generator_failure(
     tmp_path: Path,
 ) -> None:
-    """Propagate the first generator failure without starting later media."""
+    """Complete later media after an earlier generator failure."""
     root = tmp_path / "library"
     root.mkdir()
     first_source = root / "Alpha.mkv"
@@ -1649,11 +1972,18 @@ def test_directory_processor_stops_after_first_generator_failure(
     second_source.write_bytes(b"second")
     barcode_generator = _FailingBarcodeGenerator()
 
-    with pytest.raises(CinebarError) as raised_error:
-        _directory_processor(barcode_generator).process_batch(root)
+    batch_result = _directory_processor(barcode_generator).process_batch(root)
 
-    assert raised_error.value.category is FailureCategory.NO_VIDEO_STREAM
-    assert [call[0] for call in barcode_generator.calls] == [first_source]
+    assert batch_result.completed == (
+        ProcessingResult(second_source.with_name("Beta.cinebar.png"), 1, 1, 100),
+    )
+    assert batch_result.failures == (
+        BatchFailure(first_source, FailureCategory.NO_VIDEO_STREAM),
+    )
+    assert [call[0] for call in barcode_generator.calls] == [
+        first_source,
+        second_source,
+    ]
 
 
 def test_directory_processor_cleans_unpublished_artifact_after_generator_failure(
@@ -1667,16 +1997,21 @@ def test_directory_processor_cleans_unpublished_artifact_after_generator_failure
     source.write_bytes(b"source")
     output_path.write_bytes(b"previous barcode")
     barcode_generator = _RaisesAfterArtifactWriteBarcodeGenerator(
-        CinebarError(FailureCategory.NO_VIDEO_STREAM)
+        CinebarError(FailureCategory.NO_VIDEO_STREAM, "Generator detail")
     )
 
-    with pytest.raises(CinebarError) as raised_error:
-        _directory_processor(barcode_generator).process_batch(
-            root,
-            GenerationSettings(overwrite=True),
-        )
+    batch_result = _directory_processor(barcode_generator).process_batch(
+        root,
+        GenerationSettings(overwrite=True),
+    )
 
-    assert raised_error.value.category is FailureCategory.NO_VIDEO_STREAM
+    assert batch_result.failures == (
+        BatchFailure(
+            source,
+            FailureCategory.NO_VIDEO_STREAM,
+            "Generator detail",
+        ),
+    )
     assert source.read_bytes() == b"source"
     assert output_path.read_bytes() == b"previous barcode"
     assert not list(output_path.parent.glob(f".{output_path.name}.*.unpublished"))
@@ -1705,30 +2040,42 @@ def test_directory_processor_cleans_unpublished_artifact_after_interruption(
     assert not list(output_path.parent.glob(f".{output_path.name}.*.unpublished"))
 
 
-def test_directory_processor_cleans_unpublished_artifact_after_publication_failure(
+def test_directory_processor_isolates_publication_failure(
     tmp_path: Path,
 ) -> None:
-    """Remove the attempt artifact when a final directory blocks replacement."""
+    """Publish a later source after a final replacement failure."""
     root = tmp_path / "library"
-    source = root / "Movie.mkv"
-    output_path = source.with_name("Movie.cinebar.png")
+    failed_source = root / "Alpha.mkv"
+    successful_source = root / "Beta.mkv"
+    failed_output = failed_source.with_name("Alpha.cinebar.png")
+    successful_output = successful_source.with_name("Beta.cinebar.png")
     root.mkdir()
-    source.write_bytes(b"source")
+    failed_source.write_bytes(b"failed source")
+    successful_source.write_bytes(b"successful source")
     barcode_generator = _CreatesFinalOutputDuringGenerationBarcodeGenerator(
         lambda final_output_path: final_output_path.mkdir(),
-        output_path,
+        failed_output,
     )
 
-    with pytest.raises(CinebarError) as raised_error:
-        _directory_processor(barcode_generator).process_batch(
-            root,
-            GenerationSettings(overwrite=True),
-        )
+    batch_result = _directory_processor(barcode_generator).process_batch(
+        root,
+        GenerationSettings(overwrite=True),
+    )
 
-    assert raised_error.value.category is FailureCategory.OUTPUT_WRITE_FAILED
-    assert source.read_bytes() == b"source"
-    assert output_path.is_dir()
-    assert not list(output_path.parent.glob(f".{output_path.name}.*.unpublished"))
+    assert tuple(result.output_path for result in batch_result.completed) == (
+        successful_output,
+    )
+    assert batch_result.failures == (
+        BatchFailure(failed_source, FailureCategory.OUTPUT_WRITE_FAILED),
+    )
+    assert [call[0] for call in barcode_generator.calls] == [
+        failed_source,
+        successful_source,
+    ]
+    assert failed_source.read_bytes() == b"failed source"
+    assert failed_output.is_dir()
+    assert successful_output.read_bytes() == b"Beta.mkv"
+    assert not list(failed_output.parent.glob(f".{failed_output.name}.*.unpublished"))
 
 
 def test_directory_processor_preserves_competing_output(
@@ -1749,10 +2096,11 @@ def test_directory_processor_preserves_competing_output(
         output_path,
     )
 
-    with pytest.raises(CinebarError) as raised_error:
-        _directory_processor(barcode_generator).process_batch(root)
+    batch_result = _directory_processor(barcode_generator).process_batch(root)
 
-    assert raised_error.value.category is FailureCategory.OUTPUT_EXISTS
+    assert batch_result.failures == (
+        BatchFailure(source, FailureCategory.OUTPUT_EXISTS),
+    )
     assert source.read_bytes() == b"source"
     assert output_path.read_bytes() == b"competing barcode"
     assert not list(output_path.parent.glob(f".{output_path.name}.*.unpublished"))

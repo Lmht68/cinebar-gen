@@ -39,6 +39,8 @@ Each movie is generated one at a time, using the normal `--height`, `--workers`,
 Batch mode waits for each initially discovered source to keep its size and nanosecond modification time unchanged for the settling period, which defaults to 60 seconds.
 It rechecks that version immediately before and after generation, returning a changed regular source to settling while readiness time remains.
 Generation writes an unpublished same-directory artifact, so a final barcode remains absent or unchanged until atomic publication.
+Batch keeps source-version and generation-request observations only in memory for one command invocation.
+An unchanged source version receives at most one processing attempt, while a size, nanosecond modification time, generation setting, or destination change creates a new request.
 
 Without an output directory, each barcode is beside its source at `<source parent>/<stem>.cinebar.png`.
 
@@ -66,8 +68,13 @@ uv run cinebar batch ROOT --output-dir DEST --output-layout flat
 When `DEST` is a strict descendant of `ROOT`, its entire tree is excluded from source discovery.
 
 Before destination creation or generation, Cinebar compares normalized absolute destination paths.
-If two or more sources share one destination, it reports every shared destination and conflicting input, then publishes no barcode.
+If two or more sources share one destination, it records a failure for each colliding source and continues with unrelated sources.
 `--overwrite` permits replacement of an existing output, but never permits multiple sources to share a destination.
+
+Without `--overwrite`, an existing mapped output is skipped without decoding the source or checking that its source version or generation settings match the output.
+Use `--overwrite` to replace that output once for the source version during the command.
+Candidate failures, including collisions, decode errors, source changes, destination errors, and readiness timeouts, do not stop other sources from completing.
+Batch exits with status `0` when every candidate completes or is skipped, `2` after any candidate failure, `1` after a fatal startup or configuration failure, and `130` after interruption.
 
 ## Progress reporting
 
