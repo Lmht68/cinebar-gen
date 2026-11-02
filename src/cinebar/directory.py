@@ -1,5 +1,6 @@
 """Process stable media files recursively into configured barcode layouts."""
 
+import logging
 import math
 import os
 import stat
@@ -26,6 +27,9 @@ from .progress import (
     ProgressReporter,
     ProgressState,
 )
+
+LOGGER = logging.getLogger(__name__)
+
 
 _VIDEO_SUFFIXES = frozenset(
     {
@@ -368,16 +372,42 @@ class _WatchScanner:
         self._destination_owners: dict[str, dict[str, Path]] = {}
 
     def run(self) -> None:
-        """Scan until stopped and forward any scanner exception to the iterator."""
-        try:
-            self._scan()
-            while not self._watch_wait(
+        """Scan until stopped and forward fatal scanner exceptions to the iterator."""
+        root_is_unavailable = False
+        while not self._stop_event.is_set():
+            try:
+                self._scan()
+            except CinebarError as error:
+                if error.category not in {
+                    FailureCategory.ROOT_NOT_FOUND,
+                    FailureCategory.ROOT_UNREADABLE,
+                }:
+                    self._output_queue.put(error)
+                    return
+                if self._stop_event.is_set():
+                    return
+                if not root_is_unavailable:
+                    LOGGER.warning(
+                        "[%s] Watch root is unavailable; retrying in %g seconds.",
+                        error.category.value,
+                        self._settings.scan_interval_seconds,
+                    )
+                    root_is_unavailable = True
+            except BaseException as error:
+                self._output_queue.put(error)
+                return
+            else:
+                if self._stop_event.is_set():
+                    return
+                if root_is_unavailable:
+                    LOGGER.info("Watch root recovered; recursive discovery resumed.")
+                    root_is_unavailable = False
+
+            if self._stop_event.is_set() or self._watch_wait(
                 self._stop_event,
                 self._settings.scan_interval_seconds,
             ):
-                self._scan()
-        except BaseException as error:
-            self._output_queue.put(error)
+                return
 
     def _scan(self) -> None:
         """Discover every source and enqueue plans that have settled."""

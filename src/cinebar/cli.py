@@ -3,6 +3,7 @@
 import argparse
 import logging
 import math
+import signal
 import sys
 from collections.abc import Sequence
 from multiprocessing import freeze_support
@@ -215,6 +216,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         or 130 after interruption.
     """
     freeze_support()
+    if hasattr(signal, "SIGBREAK"):
+        signal.signal(signal.SIGBREAK, signal.default_int_handler)
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     arguments = list(sys.argv[1:] if argv is None else argv)
     renderer: ConsoleProgressRenderer | None = None

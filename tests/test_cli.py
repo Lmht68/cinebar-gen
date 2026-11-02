@@ -1,6 +1,8 @@
 """End-to-end tests for the installed cinebar command."""
 
+import os
 import shutil
+import signal
 import subprocess
 from fractions import Fraction
 from pathlib import Path
@@ -60,6 +62,54 @@ def _wait_for_output(
             )
         sleep(0.05)
     raise AssertionError(f"cinebar watch did not publish {output_path.name}.")
+
+
+def _start_isolated_cinebar_process(arguments: list[str]) -> subprocess.Popen[str]:
+    """Start the installed Cinebar executable in an isolated process group."""
+    cinebar_executable = shutil.which("cinebar")
+    assert cinebar_executable is not None, "Installed cinebar executable was not found."
+    if os.name == "nt":
+        return subprocess.Popen(
+            [cinebar_executable, *arguments],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+        )
+    return subprocess.Popen(
+        [cinebar_executable, *arguments],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+
+
+def _wait_for_globbed_artifact(
+    process: subprocess.Popen[str],
+    directory: Path,
+    pattern: str,
+) -> Path:
+    """Wait briefly for an artifact matching pattern or detect a stopped process."""
+    deadline = monotonic() + 10.0
+    while monotonic() < deadline:
+        matching_paths = sorted(directory.glob(pattern))
+        if matching_paths:
+            return matching_paths[0]
+        if process.poll() is not None:
+            raise AssertionError(
+                f"cinebar watch exited before creating artifact matching {pattern!r}."
+            )
+        sleep(0.05)
+    raise AssertionError(f"cinebar watch did not create artifact matching {pattern!r}.")
+
+
+def _interrupt_isolated_cinebar_process(process: subprocess.Popen[str]) -> None:
+    """Deliver the foreground-interrupt signal to Cinebar's process group."""
+    if os.name == "nt":
+        process.send_signal(signal.CTRL_BREAK_EVENT)
+        return
+    os.kill(-process.pid, signal.SIGINT)
 
 
 def _assert_installed_failure(
@@ -326,6 +376,63 @@ def test_installed_command_watches_existing_and_new_videos(tmp_path: Path) -> No
         except subprocess.TimeoutExpired:
             process.kill()
             process.communicate(timeout=5)
+
+
+def test_installed_command_interrupts_active_watch_cleanly(tmp_path: Path) -> None:
+    """Interrupt active watch generation without replacing the final barcode."""
+    root = tmp_path / "library"
+    output_dir = tmp_path / "barcodes"
+    source = root / "Movie.mkv"
+    output_path = output_dir / "Movie.cinebar.png"
+    root.mkdir()
+    output_dir.mkdir()
+    _write_lossless_fixture(source)
+    output_path.write_bytes(b"existing final barcode")
+    process = _start_isolated_cinebar_process(
+        [
+            "watch",
+            str(root),
+            "--output-dir",
+            str(output_dir),
+            "--overwrite",
+            "--crop",
+            "none",
+            "--workers",
+            "1",
+            "--height",
+            "1000000",
+            "--settling-period",
+            "0.01",
+            "--scan-interval",
+            "0.01",
+        ]
+    )
+
+    try:
+        _wait_for_globbed_artifact(
+            process,
+            output_dir,
+            f".{output_path.name}.*.unpublished",
+        )
+        _interrupt_isolated_cinebar_process(process)
+        _, stderr = process.communicate(timeout=10)
+    finally:
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.communicate(timeout=5)
+
+    assert process.returncode == 130, stderr
+    assert output_path.read_bytes() == b"existing final barcode"
+    assert not list(output_dir.glob(f".{output_path.name}.*.unpublished"))
+    assert not list(output_dir.glob("*.tmp"))
+    assert (
+        "ERROR [interrupted] Processing was interrupted; no new barcode was published."
+    ) in stderr
+    assert "Traceback" not in stderr
 
 
 def test_installed_command_returns_two_for_readiness_timeout(tmp_path: Path) -> None:

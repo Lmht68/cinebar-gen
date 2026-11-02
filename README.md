@@ -91,6 +91,14 @@ Each new or changed source version must keep its size and nanosecond modificatio
 Metadata stability is a heuristic, not proof that copying has finished.
 Each source version and resolved generation request receives at most one attempt during one watch invocation.
 A size or nanosecond modification-time change starts a new settling period and makes the changed version eligible for one later attempt.
+Watch reports startup and temporary root outages, then retries at each `--scan-interval`.
+An unavailable scan does not treat previously observed sources as deleted.
+When the root recovers, watch reports recovery and resumes recursive discovery.
+Ctrl+C stops later scans and abandons queued movies.
+It interrupts active work through normal cleanup, preserves completed barcodes, and removes unpublished and temporary artifacts.
+The interrupted source remains eligible for a later stateless invocation.
+Watch exits `130` after interruption and emits no routine traceback.
+
 
 ## Progress reporting
 

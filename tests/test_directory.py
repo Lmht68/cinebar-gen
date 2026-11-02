@@ -1,5 +1,6 @@
 """Behavior tests for stable directory barcode processing."""
 
+import logging
 import os
 import shutil
 import subprocess
@@ -257,6 +258,43 @@ class _BlockingWatchBarcodeGenerator(_WritingBarcodeGenerator):
             )
         finally:
             self.active_call_count -= 1
+
+
+class _InterruptibleWatchBarcodeGenerator(_WritingBarcodeGenerator):
+    def __init__(self, generation_active: Event) -> None:
+        super().__init__()
+        self._generation_active = generation_active
+
+    def process(
+        self,
+        media_path: Path,
+        output_path: Path,
+        height: int = 300,
+        workers: int | None = None,
+        overwrite: bool = False,
+        crop: CropSelection = CropMode.AUTO,
+        progress_reporter: ProgressReporter | None = None,
+    ) -> ProcessingResult:
+        if not self.calls:
+            return super().process(
+                media_path,
+                output_path,
+                height,
+                workers,
+                overwrite,
+                crop,
+                progress_reporter,
+            )
+
+        if len(self.calls) > 1:
+            raise AssertionError("Queued generation started after interruption.")
+
+        self.calls.append((media_path, output_path, height, workers, overwrite, crop))
+        output_path.write_bytes(b"partial barcode")
+        self._generation_active.set()
+        interruption_wait = Event()
+        while True:
+            interruption_wait.wait(0.01)
 
 
 class _FailingBarcodeGenerator(_WritingBarcodeGenerator):
@@ -2147,13 +2185,11 @@ def test_directory_processor_watch_interrupts_while_queue_is_idle(
 
     def delayed_scan(stop_event: Event, _duration: float) -> bool:
         scan_wait_started.set()
-        if stop_event.wait(1.0):
-            return True
-        root.rmdir()
-        return False
+        return stop_event.wait(1.0)
 
+    barcode_generator = _WritingBarcodeGenerator()
     outcomes = DirectoryProcessor(
-        _WritingBarcodeGenerator(),
+        barcode_generator,
         watch_wait=delayed_scan,
     ).process_watch(root)
 
@@ -2169,10 +2205,87 @@ def test_directory_processor_watch_interrupts_while_queue_is_idle(
         with pytest.raises(KeyboardInterrupt):
             next(outcomes)
         assert monotonic() - interruption_started_at < 0.5
+        assert root.is_dir()
+        assert barcode_generator.calls == []
     finally:
         outcomes.close()
         interruption_requester.join(timeout=5)
         assert not interruption_requester.is_alive()
+
+
+def test_directory_processor_watch_interrupts_active_generation_before_queued_work_starts(  # noqa: E501
+    tmp_path: Path,
+) -> None:
+    """Interrupt active work, discard it, and leave queued work unstarted."""
+    root = tmp_path / "library"
+    alpha_source = root / "Alpha.mkv"
+    beta_source = root / "Beta.mkv"
+    gamma_source = root / "Gamma.mkv"
+    alpha_output = alpha_source.with_name("Alpha.cinebar.png")
+    beta_output = beta_source.with_name("Beta.cinebar.png")
+    gamma_output = gamma_source.with_name("Gamma.cinebar.png")
+    root.mkdir()
+    alpha_source.write_bytes(b"alpha")
+    beta_source.write_bytes(b"beta")
+    gamma_source.write_bytes(b"gamma")
+
+    clock = _ControlledClock()
+    scheduler = _WatchScanScheduler(clock)
+    generation_active = Event()
+    barcode_generator = _InterruptibleWatchBarcodeGenerator(generation_active)
+    outcomes = DirectoryProcessor(
+        barcode_generator,
+        clock=clock.now,
+        watch_wait=scheduler.wait,
+    ).process_watch(
+        root,
+        GenerationSettings(
+            settling_period_seconds=5.0,
+            scan_interval_seconds=5.0,
+        ),
+    )
+
+    def request_interrupt() -> None:
+        assert generation_active.wait(timeout=5)
+        interrupt_main()
+
+    interruption_requester: Thread | None = None
+    try:
+        scheduler.permit_scans(1)
+        first_outcome = next(outcomes)
+
+        assert first_outcome == ProcessingResult(alpha_output, 1, 1, 100)
+        alpha_output_bytes = alpha_output.read_bytes()
+
+        interruption_requester = Thread(target=request_interrupt)
+        interruption_requester.start()
+        with pytest.raises(KeyboardInterrupt):
+            next(outcomes)
+
+        assert alpha_output.read_bytes() == alpha_output_bytes
+        assert not beta_output.exists()
+        assert not gamma_output.exists()
+        assert [call[0] for call in barcode_generator.calls] == [
+            alpha_source,
+            beta_source,
+        ]
+        assert not list(beta_output.parent.glob(f".{beta_output.name}.*.unpublished"))
+        assert not list(beta_output.parent.glob(f".{beta_output.name}.*.tmp"))
+    finally:
+        outcomes.close()
+        if interruption_requester is not None:
+            interruption_requester.join(timeout=5)
+            assert not interruption_requester.is_alive()
+
+    retry_generator = _WritingBarcodeGenerator()
+    retry_result = _directory_processor(retry_generator).process_batch(root)
+
+    assert retry_result.failures == ()
+    assert beta_output.read_bytes() == b"Beta.mkv"
+    assert [call[0] for call in retry_generator.calls] == [
+        beta_source,
+        gamma_source,
+    ]
 
 
 def test_directory_processor_watch_resets_settling_after_size_change(
@@ -2320,20 +2433,162 @@ def test_directory_processor_watch_reports_pending_source_disappearance(
         outcomes.close()
 
 
-def test_directory_processor_watch_forwards_root_discovery_failure(
+@pytest.mark.parametrize(
+    ("unavailable_kind", "expected_category"),
+    [
+        ("missing", FailureCategory.ROOT_NOT_FOUND),
+        ("file", FailureCategory.ROOT_UNREADABLE),
+    ],
+)
+def test_directory_processor_watch_recovers_when_root_is_unavailable_at_startup(
     tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    unavailable_kind: str,
+    expected_category: FailureCategory,
 ) -> None:
-    """Raise the initial root failure through the public watch iterator."""
-    root = tmp_path / "missing-library"
+    """Retry an unavailable startup root and discover nested media after recovery."""
+    root = tmp_path / "library"
+    source = root / "Nested" / "Movie.mkv"
+    if unavailable_kind == "file":
+        root.write_bytes(b"not a directory")
+
+    clock = _ControlledClock()
+    scheduler = _WatchScanScheduler(clock)
     barcode_generator = _WritingBarcodeGenerator()
-    outcomes = DirectoryProcessor(barcode_generator).process_watch(root)
+    processor = DirectoryProcessor(
+        barcode_generator,
+        clock=clock.now,
+        watch_wait=scheduler.wait,
+    )
+    caplog.set_level(logging.INFO, logger="cinebar.directory")
+    outcomes = processor.process_watch(
+        root,
+        GenerationSettings(
+            settling_period_seconds=5.0,
+            scan_interval_seconds=5.0,
+        ),
+    )
+
+    def restore_root() -> None:
+        if root.exists():
+            root.unlink()
+        source.parent.mkdir(parents=True)
+        source.write_bytes(b"source")
 
     try:
-        with pytest.raises(CinebarError) as raised_error:
-            next(outcomes)
+        clock.schedule_mutation(5.0, restore_root)
+        scheduler.permit_scans(2)
 
-        assert raised_error.value.category is FailureCategory.ROOT_NOT_FOUND
-        assert barcode_generator.calls == []
+        outcome = next(outcomes)
+
+        assert outcome == ProcessingResult(
+            source.with_name("Movie.cinebar.png"),
+            1,
+            1,
+            100,
+        )
+        assert [call[0] for call in barcode_generator.calls] == [source]
+        assert clock.wait_durations == [5.0, 5.0]
+        outage_messages = [
+            record.getMessage()
+            for record in caplog.records
+            if record.name == "cinebar.directory"
+            and "Watch root is unavailable" in record.getMessage()
+        ]
+        expected_outage_message = (
+            f"[{expected_category.value}] Watch root is unavailable; "
+            "retrying in 5 seconds."
+        )
+        assert outage_messages == [expected_outage_message]
+        recovery_messages = [
+            record.getMessage()
+            for record in caplog.records
+            if record.name == "cinebar.directory"
+            and record.getMessage()
+            == "Watch root recovered; recursive discovery resumed."
+        ]
+        assert recovery_messages == [
+            "Watch root recovered; recursive discovery resumed."
+        ]
+    finally:
+        outcomes.close()
+
+
+def test_directory_processor_watch_preserves_state_across_root_outage(
+    tmp_path: Path,
+) -> None:
+    """Preserve completed and settling state across one unavailable root scan."""
+    root = tmp_path / "library"
+    unavailable_root = tmp_path / "library-unavailable"
+    alpha_source = root / "Alpha.mkv"
+    beta_source = root / "Beta.mkv"
+    gamma_source = root / "Nested" / "Gamma.mkv"
+    alpha_output = alpha_source.with_name("Alpha.cinebar.png")
+    root.mkdir()
+    alpha_source.write_bytes(b"alpha")
+
+    clock = _ControlledClock()
+    scheduler = _WatchScanScheduler(clock)
+    barcode_generator = _WritingBarcodeGenerator()
+    outcomes = DirectoryProcessor(
+        barcode_generator,
+        clock=clock.now,
+        watch_wait=scheduler.wait,
+    ).process_watch(
+        root,
+        GenerationSettings(
+            settling_period_seconds=5.0,
+            scan_interval_seconds=5.0,
+        ),
+    )
+
+    def make_root_unavailable() -> None:
+        root.replace(unavailable_root)
+
+    def recover_root() -> None:
+        unavailable_root.replace(root)
+        gamma_source.parent.mkdir()
+        gamma_source.write_bytes(b"gamma")
+
+    try:
+        scheduler.permit_scans(1)
+        alpha_outcome = next(outcomes)
+
+        assert alpha_outcome == ProcessingResult(alpha_output, 1, 1, 100)
+        alpha_output_bytes = alpha_output.read_bytes()
+
+        beta_source.write_bytes(b"beta")
+        clock.schedule_mutation(15.0, make_root_unavailable)
+        clock.schedule_mutation(20.0, recover_root)
+        scheduler.permit_scans(3)
+
+        beta_outcome = next(outcomes)
+
+        assert beta_outcome == ProcessingResult(
+            beta_source.with_name("Beta.cinebar.png"),
+            1,
+            1,
+            100,
+        )
+        assert alpha_output.read_bytes() == alpha_output_bytes
+        assert clock.current_time == 20.0
+
+        scheduler.permit_scans(1)
+        gamma_outcome = next(outcomes)
+
+        assert gamma_outcome == ProcessingResult(
+            gamma_source.with_name("Gamma.cinebar.png"),
+            1,
+            1,
+            100,
+        )
+        assert alpha_output.read_bytes() == alpha_output_bytes
+        assert [call[0] for call in barcode_generator.calls] == [
+            alpha_source,
+            beta_source,
+            gamma_source,
+        ]
+        assert clock.current_time == 25.0
     finally:
         outcomes.close()
 
