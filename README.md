@@ -76,6 +76,22 @@ Use `--overwrite` to replace that output once for the source version during the 
 Candidate failures, including collisions, decode errors, source changes, destination errors, and readiness timeouts, do not stop other sources from completing.
 Batch exits with status `0` when every candidate completes or is skipped, `2` after any candidate failure, `1` after a fatal startup or configuration failure, and `130` after interruption.
 
+### Watch new and changed videos
+
+Watch mode keeps the command in the foreground until interrupted.
+It recursively catches up every eligible source present at startup, then discovers later sources through recurring recursive scans.
+
+```console
+uv run cinebar watch ROOT --output-dir DEST --scan-interval 60
+```
+
+`--scan-interval` defaults to 60 seconds.
+Watch applies the same `--height`, `--workers`, `--crop`, `--overwrite`, output-placement, and `--settling-period` options as batch mode.
+Each new or changed source version must keep its size and nanosecond modification time unchanged for the settling period before generation.
+Metadata stability is a heuristic, not proof that copying has finished.
+Each source version and resolved generation request receives at most one attempt during one watch invocation.
+A size or nanosecond modification-time change starts a new settling period and makes the changed version eligible for one later attempt.
+
 ## Progress reporting
 
 Cinebar writes progress status to stderr by default.

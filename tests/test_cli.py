@@ -4,6 +4,7 @@ import shutil
 import subprocess
 from fractions import Fraction
 from pathlib import Path
+from time import monotonic, sleep
 
 import av
 import numpy as np
@@ -11,6 +12,20 @@ import png
 import pytest
 
 RGB_COLORS = [(40, 50, 60), (0, 0, 0), (200, 80, 20), (9, 150, 230)]
+BORDERED_FRAME_COLORS = [
+    (15, 7, 3),
+    (18, 15, 11),
+    (3, 18, 33),
+    (47, 24, 12),
+    (22, 37, 15),
+    (8, 16, 24),
+    (0, 1, 2),
+    (30, 22, 7),
+    (41, 3, 26),
+    (6, 12, 18),
+    (16, 28, 39),
+    (45, 37, 30),
+]
 PRESENTATION_TIMESTAMPS = [0, 1, 4, 10]
 
 
@@ -28,6 +43,23 @@ def _run_cinebar(
         cwd=working_directory,
         text=True,
     )
+
+
+def _wait_for_output(
+    process: subprocess.Popen[str],
+    output_path: Path,
+) -> None:
+    """Wait briefly for one watch output while detecting a stopped process."""
+    deadline = monotonic() + 10.0
+    while monotonic() < deadline:
+        if output_path.exists():
+            return
+        if process.poll() is not None:
+            raise AssertionError(
+                f"cinebar watch exited before publishing {output_path.name}."
+            )
+        sleep(0.05)
+    raise AssertionError(f"cinebar watch did not publish {output_path.name}.")
 
 
 def _assert_installed_failure(
@@ -240,6 +272,60 @@ def test_installed_command_processes_nested_batch_sources(tmp_path: Path) -> Non
         3,
         RGB_COLORS,
     )
+
+
+def test_installed_command_watches_existing_and_new_videos(tmp_path: Path) -> None:
+    """Publish nested 12-frame videos at startup and during foreground watch."""
+    root = tmp_path / "library"
+    output_dir = tmp_path / "barcodes"
+    first_source = root / "Shelf A" / "Nested" / "Movie One.mkv"
+    second_source = root / "Shelf B" / "Later Movie.mkv"
+    first_output = output_dir / "Shelf A" / "Nested" / "Movie One.cinebar.png"
+    second_output = output_dir / "Shelf B" / "Later Movie.cinebar.png"
+    first_source.parent.mkdir(parents=True)
+    _write_automatic_crop_fixture(first_source)
+    cinebar_executable = shutil.which("cinebar")
+    assert cinebar_executable is not None, "Installed cinebar executable was not found."
+    process = subprocess.Popen(
+        [
+            cinebar_executable,
+            "watch",
+            str(root),
+            "--workers",
+            "2",
+            "--height",
+            "3",
+            "--crop",
+            "none",
+            "--settling-period",
+            "0.05",
+            "--scan-interval",
+            "0.05",
+            "--output-dir",
+            str(output_dir),
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+    try:
+        _wait_for_output(process, first_output)
+        assert _read_barcode(first_output) == (12, 3, BORDERED_FRAME_COLORS)
+
+        second_source.parent.mkdir(parents=True)
+        _write_automatic_crop_fixture(second_source)
+
+        _wait_for_output(process, second_output)
+        assert _read_barcode(second_output) == (12, 3, BORDERED_FRAME_COLORS)
+    finally:
+        if process.poll() is None:
+            process.terminate()
+        try:
+            process.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.communicate(timeout=5)
 
 
 def test_installed_command_returns_two_for_readiness_timeout(tmp_path: Path) -> None:
@@ -506,20 +592,51 @@ def test_installed_command_documents_batch_readiness() -> None:
     )
 
 
-@pytest.mark.parametrize("option", ["--settling-period", "--readiness-timeout"])
+def test_installed_command_documents_watch_configuration() -> None:
+    """Expose foreground watch options, defaults, and stability limits."""
+    completed_process = _run_cinebar(["watch", "--help"])
+
+    assert completed_process.returncode == 0, completed_process.stderr
+    help_text = " ".join(completed_process.stdout.split())
+    assert "--height" in help_text
+    assert "--workers" in help_text
+    assert "--crop" in help_text
+    assert "--overwrite" in help_text
+    assert "--output-beside-input" in help_text
+    assert "--output-dir PATH" in help_text
+    assert "--output-layout {mirrored,flat}" in help_text
+    assert "--settling-period SECONDS" in help_text
+    assert "--scan-interval SECONDS" in help_text
+    assert "recursively scans in the foreground until interrupted" in help_text
+    assert "Defaults to 60 seconds;" in help_text
+    assert "metadata stability is a heuristic, not proof that copying has finished" in (
+        help_text
+    )
+
+
+@pytest.mark.parametrize(
+    ("command", "option"),
+    [
+        ("batch", "--settling-period"),
+        ("batch", "--readiness-timeout"),
+        ("watch", "--settling-period"),
+        ("watch", "--scan-interval"),
+    ],
+)
 @pytest.mark.parametrize(
     "duration",
     ["not-a-duration", "nan", "inf", "-inf", "0", "-1"],
 )
-def test_installed_command_rejects_invalid_batch_readiness_durations(
+def test_installed_command_rejects_invalid_directory_durations(
     tmp_path: Path,
+    command: str,
     option: str,
     duration: str,
 ) -> None:
-    """Reject malformed, non-finite, and non-positive batch durations."""
+    """Reject malformed, non-finite, and non-positive directory durations."""
     root = tmp_path / "sensitive-batch-root"
 
-    completed_process = _run_cinebar(["batch", str(root), option, duration])
+    completed_process = _run_cinebar([command, str(root), option, duration])
 
     _assert_installed_failure(
         completed_process,

@@ -7,12 +7,13 @@ import sys
 from collections.abc import Sequence
 from multiprocessing import freeze_support
 from pathlib import Path
-from typing import NoReturn
+from typing import Literal, NoReturn
 
 from .console import ConsoleProgressRenderer
 from .crop import CropMode, CropRectangle, CropSelection
 from .directory import DirectoryProcessor, GenerationSettings, OutputLayout
 from .errors import CinebarError, FailureCategory
+from .models import BatchFailure, BatchSkip, ProcessingResult
 from .processor import SingleFileProcessor
 
 LOGGER = logging.getLogger(__name__)
@@ -78,14 +79,21 @@ def _build_single_file_parser() -> _CinebarArgumentParser:
     return parser
 
 
-def _build_batch_parser() -> _CinebarArgumentParser:
-    """Build the parser for recursive batch barcode generation."""
-    parser = _CinebarArgumentParser(
-        description=(
+def _build_directory_parser(
+    command: Literal["batch", "watch"],
+) -> _CinebarArgumentParser:
+    """Build the parser for one recursive directory command."""
+    if command == "batch":
+        description = (
             "Generate barcodes from a stable media directory. Outputs default to "
             "beside-input, or mirrored paths under --output-dir."
         )
-    )
+    else:
+        description = (
+            "Watch recursively scans in the foreground until interrupted. Outputs "
+            "default to beside-input, or mirrored paths under --output-dir."
+        )
+    parser = _CinebarArgumentParser(description=description)
     parser.add_argument(
         "root",
         type=Path,
@@ -127,13 +135,22 @@ def _build_batch_parser() -> _CinebarArgumentParser:
             "a heuristic, not proof that copying has finished."
         ),
     )
-    parser.add_argument(
-        "--readiness-timeout",
-        type=_positive_duration,
-        default=300.0,
-        metavar="SECONDS",
-        help="Limit readiness observations. Defaults to 300 seconds.",
-    )
+    if command == "batch":
+        parser.add_argument(
+            "--readiness-timeout",
+            type=_positive_duration,
+            default=300.0,
+            metavar="SECONDS",
+            help="Limit readiness observations. Defaults to 300 seconds.",
+        )
+    else:
+        parser.add_argument(
+            "--scan-interval",
+            type=_positive_duration,
+            default=60.0,
+            metavar="SECONDS",
+            help="Delay later scans. Defaults to 60 seconds.",
+        )
     _add_generation_options(
         parser,
         height_help="Barcode height in pixels. Defaults to 100.",
@@ -147,13 +164,43 @@ def _is_legacy_output_token(argument: str) -> bool:
     return option.startswith("--ou") and "--output".startswith(option)
 
 
-def _is_batch_command(arguments: Sequence[str]) -> bool:
-    """Return whether argv unambiguously selects the batch command."""
-    return (
-        bool(arguments)
-        and arguments[0] == "batch"
-        and not any(_is_legacy_output_token(argument) for argument in arguments[1:])
+def _directory_command(
+    arguments: Sequence[str],
+) -> Literal["batch", "watch"] | None:
+    """Return the unambiguous recursive directory command selected by argv."""
+    if not arguments or arguments[0] not in {"batch", "watch"}:
+        return None
+    if any(_is_legacy_output_token(argument) for argument in arguments[1:]):
+        return None
+    if arguments[0] == "batch":
+        return "batch"
+    return "watch"
+
+
+def _log_directory_outcome(
+    outcome: ProcessingResult | BatchSkip | BatchFailure,
+) -> bool:
+    """Log one non-successful directory outcome and report whether it failed."""
+    if isinstance(outcome, ProcessingResult):
+        return False
+    if isinstance(outcome, BatchSkip):
+        LOGGER.info(
+            "Skipped existing mapped output without verifying source or "
+            "generation settings.\nSource: %s\nDestination: %s",
+            outcome.source_path,
+            outcome.output_path,
+        )
+        return False
+    detail = f"Source: {outcome.source_path}"
+    if outcome.safe_detail is not None:
+        detail = f"{detail}\n{outcome.safe_detail}"
+    failure_error = CinebarError(outcome.category, detail)
+    LOGGER.error(
+        "[%s] %s",
+        failure_error.category.value,
+        failure_error,
     )
+    return True
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -163,61 +210,74 @@ def main(argv: Sequence[str] | None = None) -> int:
         argv: Optional command-line arguments excluding the program name.
 
     Returns:
-        Zero after a completed batch, two after any batch candidate failure, one
-        after a fatal failure, or 130 after interruption.
+        Zero after a completed directory batch or interrupted-free single-file
+        run, two after any batch candidate failure, one after a fatal failure,
+        or 130 after interruption.
     """
     freeze_support()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     arguments = list(sys.argv[1:] if argv is None else argv)
     renderer: ConsoleProgressRenderer | None = None
     try:
-        if _is_batch_command(arguments):
-            batch_arguments = _build_batch_parser().parse_args(arguments[1:])
+        directory_command = _directory_command(arguments)
+        if directory_command is not None:
+            directory_arguments = _build_directory_parser(directory_command).parse_args(
+                arguments[1:]
+            )
             if (
-                batch_arguments.output_layout is not None
-                and batch_arguments.output_dir is None
+                directory_arguments.output_layout is not None
+                and directory_arguments.output_dir is None
             ):
                 raise CinebarError(FailureCategory.INVALID_ARGUMENT)
             output_layout = (
                 OutputLayout.BESIDE_INPUT
-                if batch_arguments.output_beside_input
-                else batch_arguments.output_layout
+                if directory_arguments.output_beside_input
+                else directory_arguments.output_layout
+            )
+            settings = GenerationSettings(
+                height=directory_arguments.height,
+                workers=directory_arguments.workers,
+                crop=directory_arguments.crop,
+                overwrite=directory_arguments.overwrite,
+                output_dir=directory_arguments.output_dir,
+                output_layout=output_layout,
+                settling_period_seconds=directory_arguments.settling_period,
+                readiness_timeout_seconds=(
+                    directory_arguments.readiness_timeout
+                    if directory_command == "batch"
+                    else 300.0
+                ),
+                scan_interval_seconds=(
+                    directory_arguments.scan_interval
+                    if directory_command == "watch"
+                    else 60.0
+                ),
             )
             renderer = ConsoleProgressRenderer()
-            batch_result = DirectoryProcessor().process_batch(
-                root=batch_arguments.root,
-                settings=GenerationSettings(
-                    height=batch_arguments.height,
-                    workers=batch_arguments.workers,
-                    crop=batch_arguments.crop,
-                    overwrite=batch_arguments.overwrite,
-                    output_dir=batch_arguments.output_dir,
-                    output_layout=output_layout,
-                    settling_period_seconds=batch_arguments.settling_period,
-                    readiness_timeout_seconds=batch_arguments.readiness_timeout,
-                ),
-                progress_reporter=renderer,
-            )
-            renderer.finish_line()
-            for skipped in batch_result.skipped:
-                LOGGER.info(
-                    "Skipped existing mapped output without verifying source or "
-                    "generation settings.\nSource: %s\nDestination: %s",
-                    skipped.source_path,
-                    skipped.output_path,
+            directory_processor = DirectoryProcessor()
+            if directory_command == "batch":
+                batch_result = directory_processor.process_batch(
+                    root=directory_arguments.root,
+                    settings=settings,
+                    progress_reporter=renderer,
                 )
-            if batch_result.failures:
+                renderer.finish_line()
+                for skipped in batch_result.skipped:
+                    _log_directory_outcome(skipped)
+                batch_failed = False
                 for failure in batch_result.failures:
-                    detail = f"Source: {failure.source_path}"
-                    if failure.safe_detail is not None:
-                        detail = f"{detail}\n{failure.safe_detail}"
-                    failure_error = CinebarError(failure.category, detail)
-                    LOGGER.error(
-                        "[%s] %s",
-                        failure_error.category.value,
-                        failure_error,
-                    )
-                return 2
+                    batch_failed = _log_directory_outcome(failure) or batch_failed
+                if batch_failed:
+                    return 2
+            else:
+                for outcome in directory_processor.process_watch(
+                    root=directory_arguments.root,
+                    settings=settings,
+                    progress_reporter=renderer,
+                ):
+                    if not isinstance(outcome, ProcessingResult):
+                        renderer.finish_line()
+                        _log_directory_outcome(outcome)
         else:
             single_file_arguments = _build_single_file_parser().parse_args(arguments)
             renderer = ConsoleProgressRenderer()

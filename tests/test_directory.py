@@ -3,8 +3,11 @@
 import os
 import shutil
 import subprocess
+from _thread import interrupt_main
 from collections.abc import Callable
 from pathlib import Path
+from threading import Condition, Event, Thread
+from time import monotonic
 from typing import cast
 
 import pytest
@@ -80,6 +83,7 @@ def test_directory_processor_returns_empty_batch_result_with_default_readiness(
 
     assert settings.settling_period_seconds == 60.0
     assert settings.readiness_timeout_seconds == 300.0
+    assert settings.scan_interval_seconds == 60.0
     assert batch_result == BatchProcessingResult(completed=(), skipped=(), failures=())
 
 
@@ -91,10 +95,14 @@ def _with_readiness_timeout(value: object) -> GenerationSettings:
     return GenerationSettings(readiness_timeout_seconds=cast(float, value))
 
 
+def _with_scan_interval(value: object) -> GenerationSettings:
+    return GenerationSettings(scan_interval_seconds=cast(float, value))
+
+
 @pytest.mark.parametrize(
     "settings_factory",
-    [_with_settling_period, _with_readiness_timeout],
-    ids=["settling-period", "readiness-timeout"],
+    [_with_settling_period, _with_readiness_timeout, _with_scan_interval],
+    ids=["settling-period", "readiness-timeout", "scan-interval"],
 )
 @pytest.mark.parametrize(
     "invalid_value",
@@ -203,6 +211,52 @@ class _ReentrancyDetectingBarcodeGenerator(_WritingBarcodeGenerator):
         finally:
             self._is_processing = False
             self.completed_sources.append(media_path)
+
+
+class _BlockingWatchBarcodeGenerator(_WritingBarcodeGenerator):
+    def __init__(
+        self,
+        reveal_second_source: Callable[[], None],
+        generation_started: Event,
+        release_generation: Event,
+    ) -> None:
+        super().__init__()
+        self._reveal_second_source = reveal_second_source
+        self._generation_started = generation_started
+        self._release_generation = release_generation
+        self.active_call_count = 0
+        self.maximum_active_call_count = 0
+
+    def process(
+        self,
+        media_path: Path,
+        output_path: Path,
+        height: int = 300,
+        workers: int | None = None,
+        overwrite: bool = False,
+        crop: CropSelection = CropMode.AUTO,
+        progress_reporter: ProgressReporter | None = None,
+    ) -> ProcessingResult:
+        self.calls.append((media_path, output_path, height, workers, overwrite, crop))
+        self.active_call_count += 1
+        self.maximum_active_call_count = max(
+            self.maximum_active_call_count,
+            self.active_call_count,
+        )
+        try:
+            if len(self.calls) == 1:
+                self._reveal_second_source()
+                self._generation_started.set()
+                assert self._release_generation.wait(timeout=5)
+            output_path.write_bytes(media_path.name.encode())
+            return ProcessingResult(
+                output_path=output_path,
+                decoded_frame_count=1,
+                output_width=1,
+                output_height=height,
+            )
+        finally:
+            self.active_call_count -= 1
 
 
 class _FailingBarcodeGenerator(_WritingBarcodeGenerator):
@@ -540,6 +594,39 @@ class _ControlledClock:
             self.current_time = scheduled_time
             mutation()
         self.current_time = target_time
+
+
+class _WatchScanScheduler:
+    def __init__(self, clock: _ControlledClock) -> None:
+        self._clock = clock
+        self._condition = Condition()
+        self._permitted_scans = 0
+        self.completed_scans = 0
+
+    def permit_scans(self, scan_count: int) -> None:
+        assert scan_count > 0
+        with self._condition:
+            self._permitted_scans += scan_count
+            self._condition.notify_all()
+
+    def wait(self, stop_event: Event, duration: float) -> bool:
+        with self._condition:
+            while not stop_event.is_set() and self._permitted_scans == 0:
+                self._condition.wait(timeout=0.01)
+            if stop_event.is_set():
+                return True
+            self._permitted_scans -= 1
+            self._clock.wait(duration)
+            self.completed_scans += 1
+            self._condition.notify_all()
+            return False
+
+    def wait_until_completed_scans(self, scan_count: int) -> bool:
+        with self._condition:
+            return self._condition.wait_for(
+                lambda: self.completed_scans >= scan_count,
+                timeout=5,
+            )
 
 
 def _directory_processor(
@@ -1958,6 +2045,645 @@ def test_directory_processor_processes_one_movie_at_a_time(tmp_path: Path) -> No
         second_source.with_name("Beta.cinebar.png"),
     )
     assert barcode_generator.completed_sources == [first_source, second_source]
+
+
+def test_directory_processor_watch_discovers_while_generation_is_blocked(
+    tmp_path: Path,
+) -> None:
+    """Queue a later settled source while one barcode generation is active."""
+    root = tmp_path / "library"
+    first_source = root / "Alpha.mkv"
+    second_source = root / "Beta.mkv"
+    root.mkdir()
+    first_source.write_bytes(b"first")
+    clock = _ControlledClock()
+    scheduler = _WatchScanScheduler(clock)
+    generation_started = Event()
+    release_generation = Event()
+
+    def reveal_second_source() -> None:
+        second_source.write_bytes(b"second")
+
+    barcode_generator = _BlockingWatchBarcodeGenerator(
+        reveal_second_source,
+        generation_started,
+        release_generation,
+    )
+    processor = DirectoryProcessor(
+        barcode_generator,
+        clock=clock.now,
+        wait=clock.wait,
+        watch_wait=scheduler.wait,
+    )
+    outcomes = processor.process_watch(
+        root,
+        GenerationSettings(
+            settling_period_seconds=5.0,
+            scan_interval_seconds=5.0,
+        ),
+    )
+    first_outcomes: list[ProcessingResult | BatchSkip | BatchFailure] = []
+    consumer_errors: list[BaseException] = []
+    consumer: Thread | None = None
+
+    def consume_first_outcome() -> None:
+        try:
+            first_outcomes.append(next(outcomes))
+        except BaseException as error:
+            consumer_errors.append(error)
+
+    try:
+        scheduler.permit_scans(1)
+        consumer = Thread(target=consume_first_outcome)
+        consumer.start()
+        assert generation_started.wait(timeout=5)
+
+        scheduler.permit_scans(2)
+        assert scheduler.wait_until_completed_scans(3)
+
+        release_generation.set()
+        consumer.join(timeout=5)
+        assert not consumer.is_alive()
+        assert consumer_errors == []
+
+        second_outcome = next(outcomes)
+
+        assert first_outcomes == [
+            ProcessingResult(
+                first_source.with_name("Alpha.cinebar.png"),
+                1,
+                1,
+                100,
+            )
+        ]
+        assert second_outcome == ProcessingResult(
+            second_source.with_name("Beta.cinebar.png"),
+            1,
+            1,
+            100,
+        )
+        assert first_source.with_name("Alpha.cinebar.png").read_bytes() == b"Alpha.mkv"
+        assert second_source.with_name("Beta.cinebar.png").read_bytes() == b"Beta.mkv"
+        assert [call[0] for call in barcode_generator.calls] == [
+            first_source,
+            second_source,
+        ]
+        assert barcode_generator.maximum_active_call_count == 1
+    finally:
+        release_generation.set()
+        if consumer is not None:
+            consumer.join(timeout=5)
+            assert not consumer.is_alive()
+        outcomes.close()
+
+
+def test_directory_processor_watch_interrupts_while_queue_is_idle(
+    tmp_path: Path,
+) -> None:
+    """Deliver KeyboardInterrupt without waiting for a scanner queue item."""
+    root = tmp_path / "library"
+    root.mkdir()
+    scan_wait_started = Event()
+
+    def delayed_scan(stop_event: Event, _duration: float) -> bool:
+        scan_wait_started.set()
+        if stop_event.wait(1.0):
+            return True
+        root.rmdir()
+        return False
+
+    outcomes = DirectoryProcessor(
+        _WritingBarcodeGenerator(),
+        watch_wait=delayed_scan,
+    ).process_watch(root)
+
+    def request_interrupt() -> None:
+        assert scan_wait_started.wait(timeout=5)
+        Event().wait(0.05)
+        interrupt_main()
+
+    interruption_requester = Thread(target=request_interrupt)
+    try:
+        interruption_requester.start()
+        interruption_started_at = monotonic()
+        with pytest.raises(KeyboardInterrupt):
+            next(outcomes)
+        assert monotonic() - interruption_started_at < 0.5
+    finally:
+        outcomes.close()
+        interruption_requester.join(timeout=5)
+        assert not interruption_requester.is_alive()
+
+
+def test_directory_processor_watch_resets_settling_after_size_change(
+    tmp_path: Path,
+) -> None:
+    """Wait for a full new settling period after source size changes."""
+    root = tmp_path / "library"
+    source = root / "Movie.mkv"
+    root.mkdir()
+    source.write_bytes(b"source")
+    clock = _ControlledClock()
+    scheduler = _WatchScanScheduler(clock)
+    barcode_generator = _WritingBarcodeGenerator()
+    processor = DirectoryProcessor(
+        barcode_generator,
+        clock=clock.now,
+        watch_wait=scheduler.wait,
+    )
+    outcomes = processor.process_watch(
+        root,
+        GenerationSettings(
+            settling_period_seconds=5.0,
+            scan_interval_seconds=5.0,
+        ),
+    )
+
+    try:
+        clock.schedule_mutation(5.0, lambda: _change_source_size(source))
+        scheduler.permit_scans(2)
+
+        outcome = next(outcomes)
+
+        assert outcome == ProcessingResult(
+            source.with_name("Movie.cinebar.png"),
+            1,
+            1,
+            100,
+        )
+        assert source.with_name("Movie.cinebar.png").read_bytes() == (b"Movie.mkv")
+        assert [call[0] for call in barcode_generator.calls] == [source]
+        assert clock.current_time == 10.0
+    finally:
+        outcomes.close()
+
+
+def test_directory_processor_watch_resets_settling_after_mtime_change(
+    tmp_path: Path,
+) -> None:
+    """Wait for a full new settling period after source mtime changes."""
+    root = tmp_path / "library"
+    source = root / "Movie.mkv"
+    root.mkdir()
+    source.write_bytes(b"source")
+    clock = _ControlledClock()
+    scheduler = _WatchScanScheduler(clock)
+    barcode_generator = _WritingBarcodeGenerator()
+    processor = DirectoryProcessor(
+        barcode_generator,
+        clock=clock.now,
+        watch_wait=scheduler.wait,
+    )
+    outcomes = processor.process_watch(
+        root,
+        GenerationSettings(
+            settling_period_seconds=5.0,
+            scan_interval_seconds=5.0,
+        ),
+    )
+
+    try:
+        clock.schedule_mutation(
+            5.0,
+            lambda: _change_source_modification_time(source),
+        )
+        scheduler.permit_scans(2)
+
+        outcome = next(outcomes)
+
+        assert outcome == ProcessingResult(
+            source.with_name("Movie.cinebar.png"),
+            1,
+            1,
+            100,
+        )
+        assert source.with_name("Movie.cinebar.png").read_bytes() == (b"Movie.mkv")
+        assert [call[0] for call in barcode_generator.calls] == [source]
+        assert clock.current_time == 10.0
+    finally:
+        outcomes.close()
+
+
+def test_directory_processor_watch_reports_pending_source_disappearance(
+    tmp_path: Path,
+) -> None:
+    """Fail one pending source when a later successful scan omits it."""
+    root = tmp_path / "library"
+    source = root / "Movie.mkv"
+    output_path = source.with_name("Movie.cinebar.png")
+    root.mkdir()
+    source.write_bytes(b"source")
+    clock = _ControlledClock()
+    scheduler = _WatchScanScheduler(clock)
+    barcode_generator = _WritingBarcodeGenerator()
+    processor = DirectoryProcessor(
+        barcode_generator,
+        clock=clock.now,
+        watch_wait=scheduler.wait,
+    )
+    outcomes = processor.process_watch(
+        root,
+        GenerationSettings(
+            settling_period_seconds=5.0,
+            scan_interval_seconds=5.0,
+        ),
+    )
+    observed_outcomes: list[ProcessingResult | BatchSkip | BatchFailure] = []
+    consumer_errors: list[BaseException] = []
+
+    def consume_outcome() -> None:
+        try:
+            observed_outcomes.append(next(outcomes))
+        except BaseException as error:
+            consumer_errors.append(error)
+
+    consumer = Thread(target=consume_outcome)
+    try:
+        clock.schedule_mutation(5.0, source.unlink)
+        consumer.start()
+        scheduler.permit_scans(1)
+        consumer.join(timeout=1)
+        assert not consumer.is_alive()
+
+        assert observed_outcomes == [
+            BatchFailure(source, FailureCategory.INPUT_NOT_FOUND),
+        ]
+        assert consumer_errors == []
+        assert barcode_generator.calls == []
+        assert not output_path.exists()
+    finally:
+        if consumer.is_alive():
+            root.rmdir()
+            scheduler.permit_scans(1)
+            consumer.join(timeout=5)
+            assert not consumer.is_alive()
+        outcomes.close()
+
+
+def test_directory_processor_watch_forwards_root_discovery_failure(
+    tmp_path: Path,
+) -> None:
+    """Raise the initial root failure through the public watch iterator."""
+    root = tmp_path / "missing-library"
+    barcode_generator = _WritingBarcodeGenerator()
+    outcomes = DirectoryProcessor(barcode_generator).process_watch(root)
+
+    try:
+        with pytest.raises(CinebarError) as raised_error:
+            next(outcomes)
+
+        assert raised_error.value.category is FailureCategory.ROOT_NOT_FOUND
+        assert barcode_generator.calls == []
+    finally:
+        outcomes.close()
+
+
+def test_directory_processor_watch_regenerates_after_mutation_during_generation(
+    tmp_path: Path,
+) -> None:
+    """Discard an unpublished stale barcode and generate the settled replacement."""
+    root = tmp_path / "library"
+    source = root / "Movie.mkv"
+    output_path = source.with_name("Movie.cinebar.png")
+    root.mkdir()
+    source.write_bytes(b"source")
+    clock = _ControlledClock()
+    scheduler = _WatchScanScheduler(clock)
+    source_mutated = Event()
+
+    def mutate_source(media_path: Path) -> None:
+        media_path.write_bytes(b"current source")
+        source_mutated.set()
+
+    barcode_generator = _MutatesSourceDuringGenerationBarcodeGenerator(mutate_source)
+    processor = DirectoryProcessor(
+        barcode_generator,
+        clock=clock.now,
+        watch_wait=scheduler.wait,
+    )
+    outcomes = processor.process_watch(
+        root,
+        GenerationSettings(
+            settling_period_seconds=5.0,
+            scan_interval_seconds=5.0,
+        ),
+    )
+    observed_outcomes: list[ProcessingResult | BatchSkip | BatchFailure] = []
+    consumer_errors: list[BaseException] = []
+
+    def consume_outcome() -> None:
+        try:
+            observed_outcomes.append(next(outcomes))
+        except BaseException as error:
+            consumer_errors.append(error)
+
+    consumer = Thread(target=consume_outcome)
+    try:
+        scheduler.permit_scans(1)
+        consumer.start()
+        assert source_mutated.wait(timeout=5)
+
+        scheduler.permit_scans(2)
+        consumer.join(timeout=5)
+        assert not consumer.is_alive()
+        assert consumer_errors == []
+
+        assert observed_outcomes == [
+            ProcessingResult(output_path, 1, 1, 100),
+        ]
+        assert output_path.read_bytes() == b"current source"
+        assert barcode_generator.source_bytes_at_call == [
+            b"source",
+            b"current source",
+        ]
+        assert not list(output_path.parent.glob(f".{output_path.name}.*.unpublished"))
+    finally:
+        consumer.join(timeout=5)
+        assert not consumer.is_alive()
+        outcomes.close()
+
+
+def test_directory_processor_watch_skips_existing_output_without_overwrite(
+    tmp_path: Path,
+) -> None:
+    """Yield one existing-output skip without invoking or retrying generation."""
+    root = tmp_path / "library"
+    source = root / "Movie.mkv"
+    output_path = source.with_name("Movie.cinebar.png")
+    root.mkdir()
+    source.write_bytes(b"not a video")
+    output_path.write_bytes(b"previous barcode")
+    clock = _ControlledClock()
+    scheduler = _WatchScanScheduler(clock)
+    barcode_generator = _WritingBarcodeGenerator()
+    processor = DirectoryProcessor(
+        barcode_generator,
+        clock=clock.now,
+        watch_wait=scheduler.wait,
+    )
+    outcomes = processor.process_watch(
+        root,
+        GenerationSettings(
+            settling_period_seconds=5.0,
+            scan_interval_seconds=5.0,
+        ),
+    )
+
+    try:
+        scheduler.permit_scans(1)
+
+        outcome = next(outcomes)
+
+        assert outcome == BatchSkip(source, output_path)
+        scheduler.permit_scans(2)
+        assert scheduler.wait_until_completed_scans(3)
+        assert barcode_generator.calls == []
+        assert output_path.read_bytes() == b"previous barcode"
+    finally:
+        outcomes.close()
+
+
+def test_directory_processor_watch_overwrites_one_identity_once(
+    tmp_path: Path,
+) -> None:
+    """Replace an existing destination once despite repeated unchanged scans."""
+    root = tmp_path / "library"
+    source = root / "Movie.mkv"
+    output_path = source.with_name("Movie.cinebar.png")
+    root.mkdir()
+    source.write_bytes(b"source")
+    output_path.write_bytes(b"previous barcode")
+    clock = _ControlledClock()
+    scheduler = _WatchScanScheduler(clock)
+    barcode_generator = _WritingBarcodeGenerator()
+    processor = DirectoryProcessor(
+        barcode_generator,
+        clock=clock.now,
+        watch_wait=scheduler.wait,
+    )
+    outcomes = processor.process_watch(
+        root,
+        GenerationSettings(
+            overwrite=True,
+            settling_period_seconds=5.0,
+            scan_interval_seconds=5.0,
+        ),
+    )
+
+    try:
+        scheduler.permit_scans(1)
+
+        outcome = next(outcomes)
+
+        assert outcome == ProcessingResult(output_path, 1, 1, 100)
+        scheduler.permit_scans(2)
+        assert scheduler.wait_until_completed_scans(3)
+        assert [call[0] for call in barcode_generator.calls] == [source]
+        assert output_path.read_bytes() == b"Movie.mkv"
+    finally:
+        outcomes.close()
+
+
+def test_directory_processor_watch_retries_only_changed_failed_version(
+    tmp_path: Path,
+) -> None:
+    """Keep one generator failure terminal until the source metadata changes."""
+    root = tmp_path / "library"
+    source = root / "Movie.mkv"
+    output_path = source.with_name("Movie.cinebar.png")
+    root.mkdir()
+    source.write_bytes(b"source")
+    clock = _ControlledClock()
+    scheduler = _WatchScanScheduler(clock)
+    barcode_generator = _FailingBarcodeGenerator()
+    processor = DirectoryProcessor(
+        barcode_generator,
+        clock=clock.now,
+        watch_wait=scheduler.wait,
+    )
+    outcomes = processor.process_watch(
+        root,
+        GenerationSettings(
+            settling_period_seconds=5.0,
+            scan_interval_seconds=5.0,
+        ),
+    )
+
+    try:
+        scheduler.permit_scans(1)
+
+        first_outcome = next(outcomes)
+
+        clock.schedule_mutation(15.0, lambda: source.write_bytes(b"changed source"))
+        scheduler.permit_scans(3)
+        second_outcome = next(outcomes)
+
+        assert first_outcome == BatchFailure(
+            source,
+            FailureCategory.NO_VIDEO_STREAM,
+        )
+        assert second_outcome == ProcessingResult(output_path, 1, 1, 100)
+        assert [call[0] for call in barcode_generator.calls] == [source, source]
+        assert output_path.read_bytes() == b"Movie.mkv"
+        assert not list(output_path.parent.glob(f".{output_path.name}.*.unpublished"))
+    finally:
+        outcomes.close()
+
+
+def test_directory_processor_watch_retries_failed_version_in_fresh_processor(
+    tmp_path: Path,
+) -> None:
+    """Allow a fresh processor to retry an unchanged version that previously failed."""
+    root = tmp_path / "library"
+    source = root / "Movie.mkv"
+    output_path = source.with_name("Movie.cinebar.png")
+    root.mkdir()
+    source.write_bytes(b"source")
+    barcode_generator = _FailingBarcodeGenerator()
+    settings = GenerationSettings(
+        settling_period_seconds=5.0,
+        scan_interval_seconds=5.0,
+    )
+    first_clock = _ControlledClock()
+    first_scheduler = _WatchScanScheduler(first_clock)
+    first_outcomes = DirectoryProcessor(
+        barcode_generator,
+        clock=first_clock.now,
+        watch_wait=first_scheduler.wait,
+    ).process_watch(root, settings)
+
+    try:
+        first_scheduler.permit_scans(1)
+        first_outcome = next(first_outcomes)
+    finally:
+        first_outcomes.close()
+
+    second_clock = _ControlledClock()
+    second_scheduler = _WatchScanScheduler(second_clock)
+    second_outcomes = DirectoryProcessor(
+        barcode_generator,
+        clock=second_clock.now,
+        watch_wait=second_scheduler.wait,
+    ).process_watch(root, settings)
+    try:
+        second_scheduler.permit_scans(1)
+        second_outcome = next(second_outcomes)
+
+        assert first_outcome == BatchFailure(
+            source,
+            FailureCategory.NO_VIDEO_STREAM,
+        )
+        assert second_outcome == ProcessingResult(output_path, 1, 1, 100)
+        assert [call[0] for call in barcode_generator.calls] == [source, source]
+        assert output_path.read_bytes() == b"Movie.mkv"
+    finally:
+        second_outcomes.close()
+
+
+def test_directory_processor_watch_reports_same_scan_collisions(
+    tmp_path: Path,
+) -> None:
+    """Fail every source that first maps to one destination in the same scan."""
+    root = tmp_path / "library"
+    first_source = root / "first" / "Movie.mkv"
+    second_source = root / "second" / "Movie.mp4"
+    output_path = tmp_path / "barcodes" / "Movie.png"
+    first_source.parent.mkdir(parents=True)
+    second_source.parent.mkdir()
+    first_source.write_bytes(b"first")
+    second_source.write_bytes(b"second")
+    clock = _ControlledClock()
+    scheduler = _WatchScanScheduler(clock)
+    barcode_generator = _WritingBarcodeGenerator()
+    processor = DirectoryProcessor(
+        barcode_generator,
+        clock=clock.now,
+        watch_wait=scheduler.wait,
+    )
+    outcomes = processor.process_watch(
+        root,
+        GenerationSettings(
+            output_dir=output_path.parent,
+            output_layout=OutputLayout.FLAT,
+            settling_period_seconds=5.0,
+            scan_interval_seconds=5.0,
+        ),
+    )
+
+    try:
+        scheduler.permit_scans(1)
+
+        observed_outcomes = [next(outcomes), next(outcomes)]
+
+        assert observed_outcomes == [
+            BatchFailure(
+                first_source,
+                FailureCategory.OUTPUT_COLLISION,
+                f"Destination: {output_path}",
+            ),
+            BatchFailure(
+                second_source,
+                FailureCategory.OUTPUT_COLLISION,
+                f"Destination: {output_path}",
+            ),
+        ]
+        assert barcode_generator.calls == []
+        assert not output_path.exists()
+        assert not list(output_path.parent.glob(f".{output_path.name}.*.unpublished"))
+    finally:
+        outcomes.close()
+
+
+def test_directory_processor_watch_reports_later_destination_collision(
+    tmp_path: Path,
+) -> None:
+    """Keep the first source's output when a later source maps to it."""
+    root = tmp_path / "library"
+    first_source = root / "first" / "Movie.mkv"
+    second_source = root / "second" / "Movie.mp4"
+    output_path = tmp_path / "barcodes" / "Movie.png"
+    first_source.parent.mkdir(parents=True)
+    first_source.write_bytes(b"first")
+    clock = _ControlledClock()
+    scheduler = _WatchScanScheduler(clock)
+    barcode_generator = _WritingBarcodeGenerator()
+    processor = DirectoryProcessor(
+        barcode_generator,
+        clock=clock.now,
+        watch_wait=scheduler.wait,
+    )
+    outcomes = processor.process_watch(
+        root,
+        GenerationSettings(
+            output_dir=output_path.parent,
+            output_layout=OutputLayout.FLAT,
+            overwrite=True,
+            settling_period_seconds=5.0,
+            scan_interval_seconds=5.0,
+        ),
+    )
+
+    try:
+        scheduler.permit_scans(1)
+
+        first_outcome = next(outcomes)
+
+        second_source.parent.mkdir()
+        second_source.write_bytes(b"second")
+        scheduler.permit_scans(1)
+        second_outcome = next(outcomes)
+
+        assert first_outcome == ProcessingResult(output_path, 1, 1, 100)
+        assert second_outcome == BatchFailure(
+            second_source,
+            FailureCategory.OUTPUT_COLLISION,
+            f"Destination: {output_path}\nConflicting sources: {first_source}",
+        )
+        assert [call[0] for call in barcode_generator.calls] == [first_source]
+        assert output_path.read_bytes() == b"Movie.mkv"
+        assert not list(output_path.parent.glob(f".{output_path.name}.*.unpublished"))
+    finally:
+        outcomes.close()
 
 
 def test_directory_processor_isolates_generator_failure(
