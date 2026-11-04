@@ -21,6 +21,7 @@ from cinebar import (
     CinebarError,
     CropMode,
     DirectoryProcessor,
+    DirectoryProgress,
     FailureCategory,
     GenerationSettings,
     OutputLayout,
@@ -291,6 +292,9 @@ class _InterruptibleWatchBarcodeGenerator(_WritingBarcodeGenerator):
 
         self.calls.append((media_path, output_path, height, workers, overwrite, crop))
         output_path.write_bytes(b"partial barcode")
+        output_path.with_name(f".{output_path.name}.encoding.tmp").write_bytes(
+            b"partial PNG"
+        )
         self._generation_active.set()
         interruption_wait = Event()
         while True:
@@ -455,7 +459,7 @@ class _CyclesSourceVersionBarcodeGenerator(_WritingBarcodeGenerator):
             progress_reporter,
         )
         if len(self.calls) == 1:
-            media_path.write_bytes(b"new source")
+            media_path.write_bytes(b"new source version")
         elif len(self.calls) == 2:
             media_path.write_bytes(b"old source")
             source_status = media_path.stat()
@@ -2113,12 +2117,25 @@ def test_directory_processor_watch_discovers_while_generation_is_blocked(
         wait=clock.wait,
         watch_wait=scheduler.wait,
     )
+    progress_events: list[DirectoryProgress] = []
+    second_source_queued = Event()
+
+    def record_directory_progress(event: DirectoryProgress) -> None:
+        progress_events.append(event)
+        if (
+            event.discovered == 2
+            and event.queued == 1
+            and event.current_source_path == first_source
+        ):
+            second_source_queued.set()
+
     outcomes = processor.process_watch(
         root,
         GenerationSettings(
             settling_period_seconds=5.0,
             scan_interval_seconds=5.0,
         ),
+        directory_progress_reporter=record_directory_progress,
     )
     first_outcomes: list[ProcessingResult | BatchSkip | BatchFailure] = []
     consumer_errors: list[BaseException] = []
@@ -2137,6 +2154,7 @@ def test_directory_processor_watch_discovers_while_generation_is_blocked(
         assert generation_started.wait(timeout=5)
 
         scheduler.permit_scans(2)
+        assert second_source_queued.wait(timeout=5)
         assert scheduler.wait_until_completed_scans(3)
 
         release_generation.set()
@@ -2173,6 +2191,17 @@ def test_directory_processor_watch_discovers_while_generation_is_blocked(
             consumer.join(timeout=5)
             assert not consumer.is_alive()
         outcomes.close()
+    assert max(event.discovered for event in progress_events) == 2
+    assert progress_events[-1] == DirectoryProgress(
+        discovered=2,
+        waiting=0,
+        queued=0,
+        completed=2,
+        skipped=0,
+        failed=0,
+        current_source_path=None,
+        next_scan_seconds=None,
+    )
 
 
 def test_directory_processor_watch_interrupts_while_queue_is_idle(
@@ -2215,6 +2244,7 @@ def test_directory_processor_watch_interrupts_while_queue_is_idle(
 
 def test_directory_processor_watch_interrupts_active_generation_before_queued_work_starts(  # noqa: E501
     tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Interrupt active work, discard it, and leave queued work unstarted."""
     root = tmp_path / "library"
@@ -2228,6 +2258,8 @@ def test_directory_processor_watch_interrupts_active_generation_before_queued_wo
     alpha_source.write_bytes(b"alpha")
     beta_source.write_bytes(b"beta")
     gamma_source.write_bytes(b"gamma")
+    progress_events: list[DirectoryProgress] = []
+    caplog.set_level(logging.INFO, logger="cinebar.directory")
 
     clock = _ControlledClock()
     scheduler = _WatchScanScheduler(clock)
@@ -2243,6 +2275,7 @@ def test_directory_processor_watch_interrupts_active_generation_before_queued_wo
             settling_period_seconds=5.0,
             scan_interval_seconds=5.0,
         ),
+        directory_progress_reporter=progress_events.append,
     )
 
     def request_interrupt() -> None:
@@ -2271,11 +2304,31 @@ def test_directory_processor_watch_interrupts_active_generation_before_queued_wo
         ]
         assert not list(beta_output.parent.glob(f".{beta_output.name}.*.unpublished"))
         assert not list(beta_output.parent.glob(f".{beta_output.name}.*.tmp"))
+        assert not list(beta_output.parent.glob("*.tmp"))
     finally:
         outcomes.close()
         if interruption_requester is not None:
             interruption_requester.join(timeout=5)
             assert not interruption_requester.is_alive()
+    assert progress_events[-1] == DirectoryProgress(
+        discovered=3,
+        waiting=0,
+        queued=0,
+        completed=1,
+        skipped=0,
+        failed=0,
+        current_source_path=None,
+        next_scan_seconds=None,
+    )
+    interruption_messages = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "cinebar.directory"
+    ]
+    assert (
+        "Directory processing was interrupted; shutting down." in interruption_messages
+    )
+    assert "Watch shutdown complete." in interruption_messages
 
     retry_generator = _WritingBarcodeGenerator()
     retry_result = _directory_processor(retry_generator).process_batch(root)
@@ -2290,6 +2343,7 @@ def test_directory_processor_watch_interrupts_active_generation_before_queued_wo
 
 def test_directory_processor_watch_resets_settling_after_size_change(
     tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Wait for a full new settling period after source size changes."""
     root = tmp_path / "library"
@@ -2304,6 +2358,7 @@ def test_directory_processor_watch_resets_settling_after_size_change(
         clock=clock.now,
         watch_wait=scheduler.wait,
     )
+    caplog.set_level(logging.INFO, logger="cinebar.directory")
     outcomes = processor.process_watch(
         root,
         GenerationSettings(
@@ -2329,6 +2384,16 @@ def test_directory_processor_watch_resets_settling_after_size_change(
         assert clock.current_time == 10.0
     finally:
         outcomes.close()
+    source_change_messages = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "cinebar.directory"
+    ]
+    assert (
+        "Source changed; the new version must settle before processing.\n"
+        f"Source: {source}"
+    ) in source_change_messages
+    assert "Watch shutdown complete." in source_change_messages
 
 
 def test_directory_processor_watch_resets_settling_after_mtime_change(
@@ -2512,6 +2577,11 @@ def test_directory_processor_watch_recovers_when_root_is_unavailable_at_startup(
         ]
     finally:
         outcomes.close()
+    assert "Watch shutdown complete." in [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "cinebar.directory"
+    ]
 
 
 def test_directory_processor_watch_preserves_state_across_root_outage(
@@ -3085,3 +3155,93 @@ def test_directory_processor_preserves_competing_output(
     assert source.read_bytes() == b"source"
     assert output_path.read_bytes() == b"competing barcode"
     assert not list(output_path.parent.glob(f".{output_path.name}.*.unpublished"))
+
+
+def test_directory_processor_reports_batch_progress_and_lifecycle(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Report unique batch outcomes and the lifecycle that produced them."""
+    root = tmp_path / "library"
+    completed_source = root / "Complete.mkv"
+    skipped_source = root / "Skip.mkv"
+    first_collision = root / "Collision.mkv"
+    second_collision = root / "Collision.mp4"
+    skipped_output = skipped_source.with_name("Skip.cinebar.png")
+    root.mkdir()
+    completed_source.write_bytes(b"complete")
+    skipped_source.write_bytes(b"skip")
+    first_collision.write_bytes(b"first collision")
+    second_collision.write_bytes(b"second collision")
+    skipped_output.write_bytes(b"existing barcode")
+    progress_events: list[DirectoryProgress] = []
+    caplog.set_level(logging.INFO, logger="cinebar.directory")
+
+    batch_result = _directory_processor(_WritingBarcodeGenerator()).process_batch(
+        root,
+        GenerationSettings(settling_period_seconds=1.0),
+        directory_progress_reporter=progress_events.append,
+    )
+
+    assert batch_result == BatchProcessingResult(
+        completed=(
+            ProcessingResult(
+                completed_source.with_name("Complete.cinebar.png"),
+                1,
+                1,
+                100,
+            ),
+        ),
+        skipped=(BatchSkip(skipped_source, skipped_output),),
+        failures=(
+            BatchFailure(
+                first_collision,
+                FailureCategory.OUTPUT_COLLISION,
+                f"Destination: {first_collision.with_name('Collision.cinebar.png')}",
+            ),
+            BatchFailure(
+                second_collision,
+                FailureCategory.OUTPUT_COLLISION,
+                f"Destination: {second_collision.with_name('Collision.cinebar.png')}",
+            ),
+        ),
+    )
+    assert progress_events[-1] == DirectoryProgress(
+        discovered=4,
+        waiting=0,
+        queued=0,
+        completed=1,
+        skipped=1,
+        failed=2,
+        current_source_path=None,
+        next_scan_seconds=None,
+    )
+    lifecycle_messages = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "cinebar.directory"
+    ]
+    assert f"Discovered source.\nSource: {completed_source}" in lifecycle_messages
+    assert all(
+        not message.startswith("Source is ready.") for message in lifecycle_messages
+    )
+    assert (
+        "Processing source.\n"
+        f"Source: {completed_source}\n"
+        f"Destination: {completed_source.with_name('Complete.cinebar.png')}"
+    ) in lifecycle_messages
+    assert (
+        "Completed source.\n"
+        f"Source: {completed_source}\n"
+        f"Output: {completed_source.with_name('Complete.cinebar.png')}"
+    ) in lifecycle_messages
+    assert (
+        "Skipped existing mapped output without verifying source or "
+        "generation settings.\n"
+        f"Source: {skipped_source}\n"
+        f"Destination: {skipped_output}"
+    ) in lifecycle_messages
+    assert any(
+        message.startswith("[output_collision]") for message in lifecycle_messages
+    )
+    assert lifecycle_messages[-1] == "Batch processing complete."

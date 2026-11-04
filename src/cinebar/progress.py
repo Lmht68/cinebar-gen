@@ -4,6 +4,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from enum import StrEnum
 from math import isfinite
+from pathlib import Path
 from time import monotonic
 
 from .crop import CropRectangle
@@ -178,6 +179,64 @@ class ProcessingCompleted:
             self.accepted_crop, CropRectangle
         ):
             raise ValueError("accepted_crop must be a CropRectangle or None.")
+
+
+@dataclass(frozen=True, slots=True)
+class DirectoryProgress:
+    """One immutable observation from an active directory workflow.
+
+    Args:
+        discovered: Unique source versions seen during this invocation.
+        waiting: Current source versions awaiting a readiness observation.
+        queued: Current ready source versions awaiting processing.
+        completed: Unique source versions that published a barcode.
+        skipped: Unique source versions skipped for an existing output.
+        failed: Unique source versions with a terminal candidate failure.
+        current_source_path: Source currently being processed, if any.
+        next_scan_seconds: Healthy watch scan delay, if scheduled.
+
+    Raises:
+        ValueError: If a count, path, or delay is invalid.
+    """
+
+    discovered: int
+    waiting: int
+    queued: int
+    completed: int
+    skipped: int
+    failed: int
+    current_source_path: Path | None
+    next_scan_seconds: float | None
+
+    def __post_init__(self) -> None:
+        """Validate counters, source identity, and scheduled scan delay."""
+        for field_name in (
+            "discovered",
+            "waiting",
+            "queued",
+            "completed",
+            "skipped",
+            "failed",
+        ):
+            _require_nonnegative_integer(getattr(self, field_name), field_name)
+        if self.current_source_path is not None and not isinstance(
+            self.current_source_path, Path
+        ):
+            raise ValueError("current_source_path must be a Path or None.")
+        if self.next_scan_seconds is None:
+            return
+        if (
+            isinstance(self.next_scan_seconds, bool)
+            or not isinstance(self.next_scan_seconds, (int, float))
+            or not isfinite(self.next_scan_seconds)
+            or self.next_scan_seconds <= 0
+        ):
+            raise ValueError(
+                "next_scan_seconds must be a finite positive number or None."
+            )
+
+
+type DirectoryProgressReporter = Callable[[DirectoryProgress], None]
 
 
 type ProgressEvent = PhaseProgress | ProcessingCompleted

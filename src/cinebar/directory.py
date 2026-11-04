@@ -12,15 +12,17 @@ from pathlib import Path
 from queue import Empty, Queue
 from stat import S_ISDIR, S_ISREG
 from tempfile import NamedTemporaryFile
-from threading import Event, Thread
+from threading import Event, RLock, Thread
 from time import monotonic, sleep
-from typing import Protocol
+from typing import Literal, Protocol
 
 from .crop import CropMode, CropSelection
 from .errors import CinebarError, FailureCategory
 from .models import BatchFailure, BatchProcessingResult, BatchSkip, ProcessingResult
 from .processor import SingleFileProcessor
 from .progress import (
+    DirectoryProgress,
+    DirectoryProgressReporter,
     PhaseProgress,
     ProcessingCompleted,
     ProgressPhase,
@@ -317,11 +319,23 @@ def _publish_unpublished_output(
 
 
 def _remove_unpublished_output(unpublished_path: Path) -> None:
-    """Remove one unpublished output artifact when it remains reserved."""
+    """Remove an unpublished output and any nested encoder temporary files."""
+    cleanup_failed = False
+    temporary_pattern = f".{unpublished_path.name}.*.tmp"
+    try:
+        for temporary_path in unpublished_path.parent.glob(temporary_pattern):
+            try:
+                temporary_path.unlink(missing_ok=True)
+            except OSError:
+                cleanup_failed = True
+    except OSError:
+        cleanup_failed = True
     try:
         unpublished_path.unlink(missing_ok=True)
     except OSError:
-        raise CinebarError(FailureCategory.OUTPUT_WRITE_FAILED) from None
+        cleanup_failed = True
+    if cleanup_failed:
+        raise CinebarError(FailureCategory.OUTPUT_WRITE_FAILED)
 
 
 @dataclass(slots=True)
@@ -349,6 +363,228 @@ class BarcodeGenerator(Protocol):
         ...
 
 
+class _DirectoryProgressTracker:
+    """Maintain truthful directory-workflow state and lifecycle logging."""
+
+    def __init__(
+        self,
+        command: Literal["batch", "watch"],
+        reporter: DirectoryProgressReporter | None,
+    ) -> None:
+        """Create one thread-safe tracker for a directory command."""
+        if command not in {"batch", "watch"}:
+            raise ValueError("command must be 'batch' or 'watch'.")
+        self._reporter = reporter
+        self._lock = RLock()
+        self._discovered_versions: set[tuple[str, int, int]] = set()
+        self._waiting: set[_ProcessingIdentity] = set()
+        self._queued: set[_ProcessingIdentity] = set()
+        self._completed: set[_ProcessingIdentity] = set()
+        self._skipped: set[_ProcessingIdentity] = set()
+        self._failed: set[_ProcessingIdentity] = set()
+        self._current_plan: _SourcePlan | None = None
+        self._next_scan_seconds: float | None = None
+        self._finished = False
+
+    def discover(self, source_version: _SourceVersion) -> None:
+        """Record one source version when first observed during this invocation."""
+        source_key = (
+            source_version.normalized_path,
+            source_version.byte_size,
+            source_version.modification_time_ns,
+        )
+        with self._lock:
+            if source_key in self._discovered_versions:
+                return
+            self._discovered_versions.add(source_key)
+            self._emit_snapshot()
+        LOGGER.info("Discovered source.\nSource: %s", source_version.source_path)
+
+    def start_waiting(self, plan: _SourcePlan) -> None:
+        """Mark one discovered plan as waiting for a stable observation."""
+        with self._lock:
+            if self._is_terminal(plan.processing_identity):
+                return
+            if plan.processing_identity in self._waiting:
+                return
+            self._waiting.add(plan.processing_identity)
+            self._emit_snapshot()
+
+    def mark_queued(self, plan: _SourcePlan) -> None:
+        """Mark one settled source plan ready for sequential processing."""
+        with self._lock:
+            if self._is_terminal(plan.processing_identity):
+                return
+            if plan.processing_identity in self._queued:
+                return
+            self._waiting.discard(plan.processing_identity)
+            self._queued.add(plan.processing_identity)
+            self._emit_snapshot()
+
+    def start_processing(self, plan: _SourcePlan) -> None:
+        """Mark one queued source plan as the active generator request."""
+        with self._lock:
+            if (
+                self._current_plan is not None
+                and self._current_plan.processing_identity == plan.processing_identity
+            ):
+                return
+            self._waiting.discard(plan.processing_identity)
+            self._queued.discard(plan.processing_identity)
+            self._current_plan = plan
+            self._emit_snapshot()
+        LOGGER.info(
+            "Processing source.\nSource: %s\nDestination: %s",
+            plan.source_version.source_path,
+            plan.output_path,
+        )
+
+    def record_source_change(
+        self,
+        plan: _SourcePlan,
+        changed_version: _SourceVersion,
+    ) -> None:
+        """Clear stale active state and count a changed source version."""
+        changed_source_key = (
+            changed_version.normalized_path,
+            changed_version.byte_size,
+            changed_version.modification_time_ns,
+        )
+        with self._lock:
+            state_changed = self._discard_active(plan.processing_identity)
+            state_changed = (
+                changed_source_key not in self._discovered_versions or state_changed
+            )
+            self._discovered_versions.add(changed_source_key)
+            if not state_changed:
+                return
+            self._emit_snapshot()
+        LOGGER.info(
+            "Source changed; the new version must settle before processing.\n"
+            "Source: %s",
+            changed_version.source_path,
+        )
+
+    def record_outcome(
+        self,
+        plan: _SourcePlan,
+        outcome: ProcessingResult | BatchSkip | BatchFailure,
+    ) -> None:
+        """Record one terminal source outcome and emit its lifecycle event."""
+        identity = plan.processing_identity
+        with self._lock:
+            if self._is_terminal(identity):
+                return
+            self._discard_active(identity)
+            if isinstance(outcome, ProcessingResult):
+                self._completed.add(identity)
+            elif isinstance(outcome, BatchSkip):
+                self._skipped.add(identity)
+            else:
+                self._failed.add(identity)
+            self._emit_snapshot()
+        self._log_outcome(plan, outcome)
+
+    def schedule_next_scan(self, delay_seconds: float) -> None:
+        """Expose a healthy watch scan delay for idle presentation."""
+        with self._lock:
+            if self._next_scan_seconds == delay_seconds:
+                return
+            self._next_scan_seconds = delay_seconds
+            self._emit_snapshot()
+
+    def clear_next_scan(self) -> None:
+        """Clear idle-watch timing while a scan cannot proceed normally."""
+        with self._lock:
+            if self._next_scan_seconds is None:
+                return
+            self._next_scan_seconds = None
+            self._emit_snapshot()
+
+    def finish(self, *, interrupted: bool) -> None:
+        """Clear transient gauges and publish the final workflow snapshot."""
+        with self._lock:
+            if self._finished:
+                return
+            self._finished = True
+            self._waiting.clear()
+            self._queued.clear()
+            self._current_plan = None
+            self._next_scan_seconds = None
+            self._emit_snapshot()
+        if interrupted:
+            LOGGER.info("Directory processing was interrupted; shutting down.")
+
+    def _is_terminal(self, identity: _ProcessingIdentity) -> bool:
+        """Return whether one processing identity already reached an outcome."""
+        return (
+            identity in self._completed
+            or identity in self._skipped
+            or identity in self._failed
+        )
+
+    def _discard_active(self, identity: _ProcessingIdentity) -> bool:
+        """Remove one identity from transient gauges without touching newer work."""
+        was_active = identity in self._waiting or identity in self._queued
+        self._waiting.discard(identity)
+        self._queued.discard(identity)
+        if (
+            self._current_plan is not None
+            and self._current_plan.processing_identity == identity
+        ):
+            self._current_plan = None
+            return True
+        return was_active
+
+    def _emit_snapshot(self) -> None:
+        """Send a complete immutable snapshot while the state lock is held."""
+        if self._reporter is None:
+            return
+        self._reporter(
+            DirectoryProgress(
+                discovered=len(self._discovered_versions),
+                waiting=len(self._waiting),
+                queued=len(self._queued),
+                completed=len(self._completed),
+                skipped=len(self._skipped),
+                failed=len(self._failed),
+                current_source_path=(
+                    None
+                    if self._current_plan is None
+                    else self._current_plan.source_version.source_path
+                ),
+                next_scan_seconds=self._next_scan_seconds,
+            )
+        )
+
+    def _log_outcome(
+        self,
+        plan: _SourcePlan,
+        outcome: ProcessingResult | BatchSkip | BatchFailure,
+    ) -> None:
+        """Log one terminal event after its tracker snapshot is current."""
+        if isinstance(outcome, ProcessingResult):
+            LOGGER.info(
+                "Completed source.\nSource: %s\nOutput: %s",
+                plan.source_version.source_path,
+                outcome.output_path,
+            )
+            return
+        if isinstance(outcome, BatchSkip):
+            LOGGER.info(
+                "Skipped existing mapped output without verifying source or "
+                "generation settings.\nSource: %s\nDestination: %s",
+                outcome.source_path,
+                outcome.output_path,
+            )
+            return
+        detail = f"Source: {outcome.source_path}"
+        if outcome.safe_detail is not None:
+            detail = f"{detail}\n{outcome.safe_detail}"
+        failure_error = CinebarError(outcome.category, detail)
+        LOGGER.error("[%s] %s", failure_error.category.value, failure_error)
+
+
 class _WatchScanner:
     """Observe and settle source versions for one watch invocation."""
 
@@ -360,6 +596,7 @@ class _WatchScanner:
         stop_event: Event,
         clock: Callable[[], float],
         watch_wait: _WatchWait,
+        progress_tracker: _DirectoryProgressTracker,
     ) -> None:
         self._root = root
         self._settings = settings
@@ -367,6 +604,7 @@ class _WatchScanner:
         self._stop_event = stop_event
         self._clock = clock
         self._watch_wait = watch_wait
+        self._progress_tracker = progress_tracker
         self._observed_identities: set[_ProcessingIdentity] = set()
         self._pending_candidates: dict[str, _PendingSource] = {}
         self._destination_owners: dict[str, dict[str, Path]] = {}
@@ -386,6 +624,7 @@ class _WatchScanner:
                     return
                 if self._stop_event.is_set():
                     return
+                self._progress_tracker.clear_next_scan()
                 if not root_is_unavailable:
                     LOGGER.warning(
                         "[%s] Watch root is unavailable; retrying in %g seconds.",
@@ -402,6 +641,9 @@ class _WatchScanner:
                 if root_is_unavailable:
                     LOGGER.info("Watch root recovered; recursive discovery resumed.")
                     root_is_unavailable = False
+                self._progress_tracker.schedule_next_scan(
+                    self._settings.scan_interval_seconds
+                )
 
             if self._stop_event.is_set() or self._watch_wait(
                 self._stop_event,
@@ -434,6 +676,8 @@ class _WatchScanner:
                     ),
                 )
             )
+        for plan in plans:
+            self._progress_tracker.discover(plan.source_version)
         observed_at = self._clock()
         self._report_missing_pending_sources(plans)
         plans_by_destination: dict[str, list[_SourcePlan]] = {}
@@ -451,12 +695,12 @@ class _WatchScanner:
         )
         for normalized_source_path in missing_source_paths:
             pending_source = self._pending_candidates.pop(normalized_source_path)
-            self._output_queue.put(
-                BatchFailure(
-                    pending_source.plan.source_version.source_path,
-                    FailureCategory.INPUT_NOT_FOUND,
-                )
+            failure = BatchFailure(
+                pending_source.plan.source_version.source_path,
+                FailureCategory.INPUT_NOT_FOUND,
             )
+            self._progress_tracker.record_outcome(pending_source.plan, failure)
+            self._output_queue.put(failure)
 
     def _observe_destination_plans(
         self,
@@ -521,13 +765,13 @@ class _WatchScanner:
             return
         self._observed_identities.add(plan.processing_identity)
         self._pending_candidates.pop(plan.source_version.normalized_path, None)
-        self._output_queue.put(
-            BatchFailure(
-                plan.source_version.source_path,
-                FailureCategory.OUTPUT_COLLISION,
-                safe_detail,
-            )
+        failure = BatchFailure(
+            plan.source_version.source_path,
+            FailureCategory.OUTPUT_COLLISION,
+            safe_detail,
         )
+        self._progress_tracker.record_outcome(plan, failure)
+        self._output_queue.put(failure)
 
     def _observe_plan(self, plan: _SourcePlan, observed_at: float) -> None:
         """Record, settle, or supersede one current source version."""
@@ -541,6 +785,7 @@ class _WatchScanner:
                 plan=plan,
                 baseline_observed_at=observed_at,
             )
+            self._progress_tracker.start_waiting(plan)
             return
 
         if plan.processing_identity == pending_source.plan.processing_identity:
@@ -548,6 +793,7 @@ class _WatchScanner:
                 observed_at - pending_source.baseline_observed_at
                 >= self._settings.settling_period_seconds
             ):
+                self._progress_tracker.mark_queued(pending_source.plan)
                 self._output_queue.put(pending_source.plan)
                 del self._pending_candidates[normalized_source_path]
             return
@@ -556,10 +802,15 @@ class _WatchScanner:
         if plan.processing_identity in self._observed_identities:
             return
         self._observed_identities.add(plan.processing_identity)
+        self._progress_tracker.record_source_change(
+            pending_source.plan,
+            plan.source_version,
+        )
         self._pending_candidates[normalized_source_path] = _PendingSource(
             plan=plan,
             baseline_observed_at=observed_at,
         )
+        self._progress_tracker.start_waiting(plan)
 
 
 class DirectoryProcessor:
@@ -593,6 +844,7 @@ class DirectoryProcessor:
         current_version: _SourceVersion,
         settings: GenerationSettings,
         observed_at: float,
+        progress_tracker: _DirectoryProgressTracker,
     ) -> bool:
         """Queue an unobserved source version for a fresh settling period."""
         output_path = pending_source.plan.output_path
@@ -604,12 +856,15 @@ class DirectoryProcessor:
         if processing_identity in self._observed_identities:
             return False
         self._observed_identities.add(processing_identity)
+        previous_plan = pending_source.plan
         pending_source.plan = _SourcePlan(
             source_version=current_version,
             output_path=output_path,
             processing_identity=processing_identity,
         )
         pending_source.baseline_observed_at = observed_at
+        progress_tracker.record_source_change(previous_plan, current_version)
+        progress_tracker.start_waiting(pending_source.plan)
         return True
 
     def _process_ready_source(
@@ -739,6 +994,7 @@ class DirectoryProcessor:
         root: Path,
         settings: GenerationSettings = GenerationSettings(),  # noqa: B008
         progress_reporter: ProgressReporter | None = None,
+        directory_progress_reporter: DirectoryProgressReporter | None = None,
     ) -> BatchProcessingResult:
         """Generate one barcode for every supported media file using settings.
 
@@ -746,208 +1002,239 @@ class DirectoryProcessor:
             root: Directory tree containing stable source media files.
             settings: Shared generation settings for every source media file.
             progress_reporter: Optional recipient for per-file progress facts.
+            directory_progress_reporter: Optional recipient for directory facts.
 
         Returns:
             Completed barcode results and readiness failures.
         """
-        _validate_root(root)
-
-        excluded_directory = (
-            settings.output_dir
-            if settings.output_dir is not None
-            and _is_within_directory(settings.output_dir, root, strict=True)
-            else None
+        progress_tracker = _DirectoryProgressTracker(
+            "batch",
+            directory_progress_reporter,
         )
-        source_versions = _discover_sources(root, excluded_directory)
-        output_sources: dict[str, tuple[Path, dict[str, Path]]] = {}
-        plans: list[_SourcePlan] = []
-        discovered_identities: set[_ProcessingIdentity] = set()
-        for source_version in source_versions:
-            source_path = source_version.source_path
-            output_path = _resolve_output_path(root, source_path, settings)
-            output_key = normcase(abspath(output_path))
-            source_paths = output_sources.setdefault(
-                output_key,
-                (Path(abspath(output_path)), {}),
-            )[1]
-            source_paths.setdefault(
-                source_version.normalized_path,
-                Path(abspath(source_path)),
-            )
-            processing_identity = _processing_identity(
-                source_version,
-                output_path,
-                settings,
-            )
-            if (
-                processing_identity in self._observed_identities
-                or processing_identity in discovered_identities
-            ):
-                continue
-            discovered_identities.add(processing_identity)
-            plans.append(
-                _SourcePlan(
-                    source_version=source_version,
-                    output_path=output_path,
-                    processing_identity=processing_identity,
+        interrupted = False
+        completed_normally = False
+        try:
+            _validate_root(root)
+            excluded_directory = _excluded_output_directory(root, settings)
+            source_versions = _discover_sources(root, excluded_directory)
+            output_sources: dict[str, tuple[Path, dict[str, Path]]] = {}
+            plans: list[_SourcePlan] = []
+            discovered_identities: set[_ProcessingIdentity] = set()
+            for source_version in source_versions:
+                progress_tracker.discover(source_version)
+                source_path = source_version.source_path
+                output_path = _resolve_output_path(root, source_path, settings)
+                output_key = normcase(abspath(output_path))
+                source_paths = output_sources.setdefault(
+                    output_key,
+                    (Path(abspath(output_path)), {}),
+                )[1]
+                source_paths.setdefault(
+                    source_version.normalized_path,
+                    Path(abspath(source_path)),
                 )
-            )
+                processing_identity = _processing_identity(
+                    source_version,
+                    output_path,
+                    settings,
+                )
+                if (
+                    processing_identity in self._observed_identities
+                    or processing_identity in discovered_identities
+                ):
+                    continue
+                discovered_identities.add(processing_identity)
+                plans.append(
+                    _SourcePlan(
+                        source_version=source_version,
+                        output_path=output_path,
+                        processing_identity=processing_identity,
+                    )
+                )
 
-        collision_destinations = {
-            output_key: destination
-            for output_key, (destination, source_paths) in output_sources.items()
-            if len(source_paths) >= 2
-        }
-        completed: list[ProcessingResult] = []
-        skipped: list[BatchSkip] = []
-        failures: list[BatchFailure] = []
-        readiness_started_at = self._clock()
-        readiness_deadline = readiness_started_at + settings.readiness_timeout_seconds
-        pending_sources: list[_PendingSource] = []
-        for plan in plans:
-            collision_destination = collision_destinations.get(
-                normcase(abspath(plan.output_path))
+            collision_destinations = {
+                output_key: destination
+                for output_key, (destination, source_paths) in output_sources.items()
+                if len(source_paths) >= 2
+            }
+            completed: list[ProcessingResult] = []
+            skipped: list[BatchSkip] = []
+            failures: list[BatchFailure] = []
+            readiness_started_at = self._clock()
+            readiness_deadline = (
+                readiness_started_at + settings.readiness_timeout_seconds
             )
-            self._observed_identities.add(plan.processing_identity)
-            if collision_destination is not None:
-                failures.append(
-                    BatchFailure(
+            pending_sources: list[_PendingSource] = []
+            for plan in plans:
+                collision_destination = collision_destinations.get(
+                    normcase(abspath(plan.output_path))
+                )
+                self._observed_identities.add(plan.processing_identity)
+                if collision_destination is not None:
+                    failure = BatchFailure(
                         plan.source_version.source_path,
                         FailureCategory.OUTPUT_COLLISION,
                         f"Destination: {collision_destination}",
                     )
-                )
-                continue
-            pending_sources.append(
-                _PendingSource(
+                    failures.append(failure)
+                    progress_tracker.record_outcome(plan, failure)
+                    continue
+                pending_source = _PendingSource(
                     plan=plan,
                     baseline_observed_at=readiness_started_at,
                 )
-            )
+                pending_sources.append(pending_source)
+                progress_tracker.start_waiting(plan)
 
-        if not pending_sources:
+            while pending_sources:
+                current_time = self._clock()
+                timed_out_sources: list[_PendingSource] = []
+                if current_time > readiness_deadline:
+                    timed_out_sources = sorted(
+                        pending_sources,
+                        key=lambda source: source.plan.source_version.normalized_path,
+                    )
+                else:
+                    next_observation_at = min(
+                        pending_source.baseline_observed_at
+                        + settings.settling_period_seconds
+                        for pending_source in pending_sources
+                    )
+                    if next_observation_at > readiness_deadline:
+                        timed_out_sources = sorted(
+                            pending_sources,
+                            key=lambda source: (
+                                source.plan.source_version.normalized_path
+                            ),
+                        )
+                if timed_out_sources:
+                    for pending_source in timed_out_sources:
+                        failure = BatchFailure(
+                            pending_source.plan.source_version.source_path,
+                            FailureCategory.READINESS_TIMEOUT,
+                        )
+                        failures.append(failure)
+                        progress_tracker.record_outcome(pending_source.plan, failure)
+                    break
+                if current_time < next_observation_at:
+                    self._wait(next_observation_at - current_time)
+                    continue
+
+                due_sources = sorted(
+                    (
+                        pending_source
+                        for pending_source in pending_sources
+                        if pending_source.baseline_observed_at
+                        + settings.settling_period_seconds
+                        <= current_time
+                    ),
+                    key=lambda source: source.plan.source_version.normalized_path,
+                )
+                if not due_sources:
+                    continue
+
+                ready_sources: list[_PendingSource] = []
+                due_source_ids = {id(pending_source) for pending_source in due_sources}
+                next_pending_sources = [
+                    pending_source
+                    for pending_source in pending_sources
+                    if id(pending_source) not in due_source_ids
+                ]
+                for pending_source in due_sources:
+                    source_path = pending_source.plan.source_version.source_path
+                    try:
+                        current_version = _observe_source_version(
+                            pending_source.plan.source_version
+                        )
+                    except CinebarError as error:
+                        if error.category is FailureCategory.INTERRUPTED:
+                            raise
+                        failure = BatchFailure(
+                            source_path,
+                            error.category,
+                            error.safe_detail,
+                        )
+                        failures.append(failure)
+                        progress_tracker.record_outcome(pending_source.plan, failure)
+                        continue
+
+                    if current_version == pending_source.plan.source_version:
+                        ready_sources.append(pending_source)
+                        continue
+
+                    if self._queue_changed_source_version(
+                        pending_source,
+                        current_version,
+                        settings,
+                        current_time,
+                        progress_tracker,
+                    ):
+                        next_pending_sources.append(pending_source)
+
+                pending_sources = next_pending_sources
+                for pending_source in ready_sources:
+                    progress_tracker.mark_queued(pending_source.plan)
+                for pending_source in ready_sources:
+                    progress_tracker.start_processing(pending_source.plan)
+                    source_attempt = self._process_ready_source(
+                        pending_source.plan,
+                        settings,
+                        progress_reporter,
+                    )
+                    if source_attempt.changed_version is not None:
+                        if self._queue_changed_source_version(
+                            pending_source,
+                            source_attempt.changed_version,
+                            settings,
+                            self._clock(),
+                            progress_tracker,
+                        ):
+                            pending_sources.append(pending_source)
+                        continue
+                    if isinstance(source_attempt.outcome, ProcessingResult):
+                        completed.append(source_attempt.outcome)
+                        progress_tracker.record_outcome(
+                            pending_source.plan,
+                            source_attempt.outcome,
+                        )
+                    elif isinstance(source_attempt.outcome, BatchSkip):
+                        skipped.append(source_attempt.outcome)
+                        progress_tracker.record_outcome(
+                            pending_source.plan,
+                            source_attempt.outcome,
+                        )
+                    elif isinstance(source_attempt.outcome, BatchFailure):
+                        failures.append(source_attempt.outcome)
+                        progress_tracker.record_outcome(
+                            pending_source.plan,
+                            source_attempt.outcome,
+                        )
+
+            completed_normally = True
             return BatchProcessingResult(
                 completed=tuple(completed),
                 skipped=tuple(skipped),
                 failures=tuple(failures),
             )
-
-        while pending_sources:
-            current_time = self._clock()
-            if current_time > readiness_deadline:
-                failures.extend(
-                    BatchFailure(
-                        pending_source.plan.source_version.source_path,
-                        FailureCategory.READINESS_TIMEOUT,
-                    )
-                    for pending_source in sorted(
-                        pending_sources,
-                        key=lambda source: source.plan.source_version.normalized_path,
-                    )
-                )
-                break
-
-            next_observation_at = min(
-                pending_source.baseline_observed_at + settings.settling_period_seconds
-                for pending_source in pending_sources
-            )
-            if next_observation_at > readiness_deadline:
-                failures.extend(
-                    BatchFailure(
-                        pending_source.plan.source_version.source_path,
-                        FailureCategory.READINESS_TIMEOUT,
-                    )
-                    for pending_source in sorted(
-                        pending_sources,
-                        key=lambda source: source.plan.source_version.normalized_path,
-                    )
-                )
-                break
-
-            if current_time < next_observation_at:
-                self._wait(next_observation_at - current_time)
-                continue
-
-            due_sources = sorted(
-                (
-                    pending_source
-                    for pending_source in pending_sources
-                    if pending_source.baseline_observed_at
-                    + settings.settling_period_seconds
-                    <= current_time
-                ),
-                key=lambda source: source.plan.source_version.normalized_path,
-            )
-            if not due_sources:
-                continue
-
-            ready_sources: list[_PendingSource] = []
-            due_source_ids = {id(pending_source) for pending_source in due_sources}
-            next_pending_sources = [
-                pending_source
-                for pending_source in pending_sources
-                if id(pending_source) not in due_source_ids
-            ]
-            for pending_source in due_sources:
-                source_path = pending_source.plan.source_version.source_path
-                try:
-                    current_version = _observe_source_version(
-                        pending_source.plan.source_version
-                    )
-                except CinebarError as error:
-                    if error.category is FailureCategory.INTERRUPTED:
-                        raise
-                    failures.append(
-                        BatchFailure(source_path, error.category, error.safe_detail)
-                    )
-                    continue
-
-                if current_version == pending_source.plan.source_version:
-                    ready_sources.append(pending_source)
-                    continue
-
-                if self._queue_changed_source_version(
-                    pending_source,
-                    current_version,
-                    settings,
-                    current_time,
-                ):
-                    next_pending_sources.append(pending_source)
-
-            pending_sources = next_pending_sources
-            for pending_source in ready_sources:
-                source_attempt = self._process_ready_source(
-                    pending_source.plan,
-                    settings,
-                    progress_reporter,
-                )
-                if source_attempt.changed_version is not None:
-                    if self._queue_changed_source_version(
-                        pending_source,
-                        source_attempt.changed_version,
-                        settings,
-                        self._clock(),
-                    ):
-                        pending_sources.append(pending_source)
-                    continue
-                if isinstance(source_attempt.outcome, ProcessingResult):
-                    completed.append(source_attempt.outcome)
-                elif isinstance(source_attempt.outcome, BatchSkip):
-                    skipped.append(source_attempt.outcome)
-                elif isinstance(source_attempt.outcome, BatchFailure):
-                    failures.append(source_attempt.outcome)
-
-        return BatchProcessingResult(
-            completed=tuple(completed),
-            skipped=tuple(skipped),
-            failures=tuple(failures),
-        )
+        except CinebarError as error:
+            interrupted = error.category is FailureCategory.INTERRUPTED
+            raise
+        except KeyboardInterrupt:
+            interrupted = True
+            raise
+        finally:
+            progress_tracker.finish(interrupted=interrupted)
+            if interrupted:
+                LOGGER.info("Batch shutdown complete.")
+            elif completed_normally:
+                LOGGER.info("Batch processing complete.")
 
     def process_watch(
         self,
         root: Path,
         settings: GenerationSettings = GenerationSettings(),  # noqa: B008
         progress_reporter: ProgressReporter | None = None,
+        directory_progress_reporter: DirectoryProgressReporter | None = None,
     ) -> Generator[ProcessingResult | BatchSkip | BatchFailure, None, None]:
         """Watch a directory tree and yield each terminal source outcome.
 
@@ -955,10 +1242,15 @@ class DirectoryProcessor:
             root: Directory tree containing source media files to watch.
             settings: Shared generation settings for every source media file.
             progress_reporter: Optional recipient for per-file progress facts.
+            directory_progress_reporter: Optional recipient for directory facts.
 
         Yields:
             Completed, skipped, and failed source outcomes as they become final.
         """
+        progress_tracker = _DirectoryProgressTracker(
+            "watch",
+            directory_progress_reporter,
+        )
         output_queue: Queue[_WatchQueueItem] = Queue()
         stop_event = Event()
         scanner = _WatchScanner(
@@ -968,8 +1260,10 @@ class DirectoryProcessor:
             stop_event,
             self._clock,
             self._watch_wait,
+            progress_tracker,
         )
         scanner_thread = Thread(target=scanner.run, daemon=False)
+        interrupted = False
         scanner_thread.start()
         try:
             while True:
@@ -983,19 +1277,35 @@ class DirectoryProcessor:
                     yield queued_item
                     continue
 
+                progress_tracker.start_processing(queued_item)
                 source_attempt = self._process_ready_source(
                     queued_item,
                     settings,
                     progress_reporter,
                 )
-                if (
-                    source_attempt.changed_version is None
-                    and source_attempt.outcome is not None
-                ):
+                if source_attempt.changed_version is not None:
+                    progress_tracker.record_source_change(
+                        queued_item,
+                        source_attempt.changed_version,
+                    )
+                    continue
+                if source_attempt.outcome is not None:
+                    progress_tracker.record_outcome(
+                        queued_item,
+                        source_attempt.outcome,
+                    )
                     yield source_attempt.outcome
+        except CinebarError as error:
+            interrupted = error.category is FailureCategory.INTERRUPTED
+            raise
+        except KeyboardInterrupt:
+            interrupted = True
+            raise
         finally:
             stop_event.set()
             scanner_thread.join()
+            progress_tracker.finish(interrupted=interrupted)
+            LOGGER.info("Watch shutdown complete.")
 
 
 def _discover_sources(

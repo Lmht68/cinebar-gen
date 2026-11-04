@@ -6,6 +6,7 @@ import signal
 import subprocess
 from fractions import Fraction
 from pathlib import Path
+from tempfile import TemporaryFile
 from time import monotonic, sleep
 
 import av
@@ -322,6 +323,25 @@ def test_installed_command_processes_nested_batch_sources(tmp_path: Path) -> Non
         3,
         RGB_COLORS,
     )
+    assert completed_process.stderr.endswith("\n")
+    assert "\x1b" not in completed_process.stderr
+    assert "INFO Discovered source." in completed_process.stderr
+    assert (
+        f"INFO Discovered source.\n  Source: {first_source}" in completed_process.stderr
+    )
+    assert "Source is ready." not in completed_process.stderr
+    assert "INFO Processing source." in completed_process.stderr
+    assert "INFO Completed source." in completed_process.stderr
+    assert "INFO Batch processing complete." in completed_process.stderr
+    assert (
+        "Discovered 2 | Waiting 0 | Queued 0 | Completed 2 | Skipped 0 | Failed 0"
+    ) in completed_process.stderr
+    stats_lines = [
+        line
+        for line in completed_process.stderr.splitlines()
+        if line.startswith("Discovered ")
+    ]
+    assert len(stats_lines) == 3
 
 
 def test_installed_command_watches_existing_and_new_videos(tmp_path: Path) -> None:
@@ -336,46 +356,59 @@ def test_installed_command_watches_existing_and_new_videos(tmp_path: Path) -> No
     _write_automatic_crop_fixture(first_source)
     cinebar_executable = shutil.which("cinebar")
     assert cinebar_executable is not None, "Installed cinebar executable was not found."
-    process = subprocess.Popen(
-        [
-            cinebar_executable,
-            "watch",
-            str(root),
-            "--workers",
-            "2",
-            "--height",
-            "3",
-            "--crop",
-            "none",
-            "--settling-period",
-            "0.05",
-            "--scan-interval",
-            "0.05",
-            "--output-dir",
-            str(output_dir),
-        ],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-
-    try:
-        _wait_for_output(process, first_output)
-        assert _read_barcode(first_output) == (12, 3, BORDERED_FRAME_COLORS)
-
-        second_source.parent.mkdir(parents=True)
-        _write_automatic_crop_fixture(second_source)
-
-        _wait_for_output(process, second_output)
-        assert _read_barcode(second_output) == (12, 3, BORDERED_FRAME_COLORS)
-    finally:
-        if process.poll() is None:
-            process.terminate()
+    stderr = ""
+    with TemporaryFile(mode="w+b") as captured_stderr:
+        process = subprocess.Popen(
+            [
+                cinebar_executable,
+                "watch",
+                str(root),
+                "--workers",
+                "2",
+                "--height",
+                "3",
+                "--crop",
+                "none",
+                "--settling-period",
+                "0.05",
+                "--scan-interval",
+                "0.05",
+                "--output-dir",
+                str(output_dir),
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=captured_stderr,
+            text=True,
+        )
         try:
-            process.communicate(timeout=5)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.communicate(timeout=5)
+            _wait_for_output(process, first_output)
+            assert _read_barcode(first_output) == (12, 3, BORDERED_FRAME_COLORS)
+
+            second_source.parent.mkdir(parents=True)
+            _write_automatic_crop_fixture(second_source)
+
+            _wait_for_output(process, second_output)
+            assert _read_barcode(second_output) == (12, 3, BORDERED_FRAME_COLORS)
+        finally:
+            if process.poll() is None:
+                process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5)
+            captured_stderr.seek(0)
+            stderr = captured_stderr.read().decode()
+
+    assert "INFO Discovered source." in stderr
+    assert "Source is ready." not in stderr
+    assert "INFO Processing source." in stderr
+    assert "INFO Completed source." in stderr
+    assert "\r" in stderr
+    status_lines = [update.partition("\n")[0] for update in stderr.split("\r")[1:]]
+    assert status_lines
+    assert all(len(status_line) <= 79 for status_line in status_lines)
+    assert "\x1b" not in stderr
 
 
 def test_installed_command_interrupts_active_watch_cleanly(tmp_path: Path) -> None:
@@ -433,6 +466,10 @@ def test_installed_command_interrupts_active_watch_cleanly(tmp_path: Path) -> No
         "ERROR [interrupted] Processing was interrupted; no new barcode was published."
     ) in stderr
     assert "Traceback" not in stderr
+    assert "INFO Directory processing was interrupted; shutting down." in stderr
+    assert "INFO Watch shutdown complete." in stderr
+    assert stderr.endswith("\n")
+    assert "\x1b" not in stderr
 
 
 def test_installed_command_returns_two_for_readiness_timeout(tmp_path: Path) -> None:
@@ -697,6 +734,21 @@ def test_installed_command_documents_batch_readiness() -> None:
     assert "metadata stability is a heuristic, not proof that copying has finished" in (
         help_text
     )
+    assert "cinebar batch ROOT --output-beside-input" in help_text
+    assert "cinebar batch ROOT --output-dir DEST" in help_text
+    assert "cinebar batch ROOT --output-dir DEST --output-layout flat" in help_text
+    assert "Existing mapped outputs are skipped without source freshness checks." in (
+        help_text
+    )
+    assert (
+        "Collisions list conflicting sources and remain errors with --overwrite."
+        in (help_text)
+    )
+    assert "Each source version receives one attempt per invocation." in help_text
+    assert (
+        "Exit codes: 0 complete or skipped, 1 fatal, 2 candidate failure, 130 Ctrl+C."
+        in (help_text)
+    )
 
 
 def test_installed_command_documents_watch_configuration() -> None:
@@ -719,6 +771,22 @@ def test_installed_command_documents_watch_configuration() -> None:
     assert "metadata stability is a heuristic, not proof that copying has finished" in (
         help_text
     )
+    assert "cinebar watch ROOT --output-dir DEST --scan-interval 60" in help_text
+    assert "One source version receives one attempt per invocation." in help_text
+    assert "Temporary root outages retry without clearing known state." in help_text
+    assert "Ctrl+C abandons queued work and cleans active unpublished output." in (
+        help_text
+    )
+    assert "Exit codes: 1 fatal, 130 Ctrl+C." in help_text
+
+
+def test_installed_command_points_to_directory_workflows() -> None:
+    """Direct legacy help users to the explicit recursive command help."""
+    completed_process = _run_cinebar(["--help"])
+
+    assert completed_process.returncode == 0, completed_process.stderr
+    assert "cinebar batch --help" in completed_process.stdout
+    assert "cinebar watch --help" in completed_process.stdout
 
 
 @pytest.mark.parametrize(

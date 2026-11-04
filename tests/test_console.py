@@ -1,9 +1,13 @@
 """Tests for terminal rendering of application-owned progress facts."""
 
+import logging
 from io import StringIO
 from pathlib import Path
 
+import pytest
+
 from cinebar import (
+    DirectoryProgress,
     PhaseProgress,
     ProcessingCompleted,
     ProcessingResult,
@@ -11,7 +15,7 @@ from cinebar import (
     ProgressState,
     ProgressUnit,
 )
-from cinebar.console import ConsoleProgressRenderer
+from cinebar.console import ConsoleProgressRenderer, DirectoryConsolePresenter
 
 
 class _InteractiveStream(StringIO):
@@ -50,6 +54,20 @@ def _phase_progress(
         eta_seconds=eta_seconds,
         worker_count=worker_count,
     )
+
+
+def test_directory_progress_rejects_invalid_facts() -> None:
+    """Reject invalid public directory-progress measurements."""
+    with pytest.raises(ValueError, match="non-negative integer"):
+        DirectoryProgress(-1, 0, 0, 0, 0, 0, None, None)
+    with pytest.raises(ValueError, match="non-negative integer"):
+        DirectoryProgress(0, True, 0, 0, 0, 0, None, None)
+    with pytest.raises(ValueError, match="Path or None"):
+        DirectoryProgress(0, 0, 0, 0, 0, 0, "Movie.mkv", None)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="finite positive"):
+        DirectoryProgress(0, 0, 0, 0, 0, 0, None, 0.0)
+    with pytest.raises(ValueError, match="finite positive"):
+        DirectoryProgress(0, 0, 0, 0, 0, 0, None, float("inf"))
 
 
 def test_interactive_renderer_shows_estimates_workers_eta_and_summary() -> None:
@@ -139,20 +157,21 @@ def test_interactive_renderer_bounces_without_untrustworthy_eta() -> None:
     assert "%" not in rendered
 
 
-def test_noninteractive_renderer_rate_limits_running_updates() -> None:
-    """Preserve phase boundaries while limiting redirected running status lines."""
+def test_renderer_replaces_progress_on_non_tty_stream() -> None:
+    """Redraw progress in place even when the stream does not report a TTY."""
     stream = StringIO()
     renderer = ConsoleProgressRenderer(stream)
-    started = _phase_progress(
-        phase=ProgressPhase.PNG_ENCODING,
-        state=ProgressState.STARTED,
-        completed_units=0,
-        total_units=3,
-        unit=ProgressUnit.ROWS,
-        fraction_complete=0.0,
-    )
 
-    renderer(started)
+    renderer(
+        _phase_progress(
+            phase=ProgressPhase.PNG_ENCODING,
+            state=ProgressState.STARTED,
+            completed_units=0,
+            total_units=3,
+            unit=ProgressUnit.ROWS,
+            fraction_complete=0.0,
+        )
+    )
     renderer(
         _phase_progress(
             phase=ProgressPhase.PNG_ENCODING,
@@ -161,20 +180,8 @@ def test_noninteractive_renderer_rate_limits_running_updates() -> None:
             total_units=3,
             unit=ProgressUnit.ROWS,
             fraction_complete=1 / 3,
-            elapsed_seconds=29.0,
-            rate_per_second=1 / 29,
-        )
-    )
-    renderer(
-        _phase_progress(
-            phase=ProgressPhase.PNG_ENCODING,
-            state=ProgressState.RUNNING,
-            completed_units=2,
-            total_units=3,
-            unit=ProgressUnit.ROWS,
-            fraction_complete=2 / 3,
-            elapsed_seconds=30.0,
-            rate_per_second=2 / 30,
+            elapsed_seconds=1.0,
+            rate_per_second=1.0,
         )
     )
     renderer(
@@ -185,17 +192,44 @@ def test_noninteractive_renderer_rate_limits_running_updates() -> None:
             total_units=3,
             unit=ProgressUnit.ROWS,
             fraction_complete=1.0,
-            elapsed_seconds=31.0,
-            rate_per_second=3 / 31,
+            elapsed_seconds=3.0,
+            rate_per_second=1.0,
+        )
+    )
+    renderer.finish_line()
+
+    rendered = stream.getvalue()
+
+    assert rendered.count("\r") == 3
+    assert rendered.count("\n") == 1
+    assert rendered.endswith("\n")
+    assert "1/3 rows" in rendered
+    assert "3/3 rows" in rendered
+
+
+def test_renderer_keeps_multiworker_redraw_within_one_terminal_row() -> None:
+    """Keep a detailed multi-worker update within the fallback terminal width."""
+    stream = StringIO()
+    renderer = ConsoleProgressRenderer(stream)
+
+    renderer(
+        _phase_progress(
+            phase=ProgressPhase.FRAME_DECODING,
+            state=ProgressState.RUNNING,
+            completed_units=12_345,
+            total_units=98_765,
+            unit=ProgressUnit.FRAMES,
+            fraction_complete=0.125,
+            elapsed_seconds=3_723.0,
+            rate_per_second=123.4,
+            eta_seconds=25_000.0,
+            worker_count=16,
         )
     )
 
-    lines = stream.getvalue().splitlines()
+    status_line = stream.getvalue().removeprefix("\r")
 
-    assert len(lines) == 3
-    assert lines[0].startswith("Encoding PNG")
-    assert "2/3 rows" in lines[1]
-    assert lines[2].startswith("Encoding PNG")
+    assert len(status_line) <= 80
 
 
 def test_finish_line_starts_error_output_on_a_clean_line() -> None:
@@ -242,3 +276,239 @@ def test_renderer_omits_single_file_publication_rate() -> None:
     assert "Publishing output" in rendered
     assert "elapsed" not in rendered
     assert "12.8 files/s" not in rendered
+
+
+def test_directory_presenter_renders_active_progress_and_safe_logs() -> None:
+    """Show truthful directory state around a clean interactive log line."""
+    stream = _InteractiveStream()
+    presenter = DirectoryConsolePresenter(stream)
+    presenter.setFormatter(logging.Formatter("%(levelname)s %(message)s"))
+    source_path = Path("Library") / "Movie.mkv"
+    presenter.report_directory_progress(
+        DirectoryProgress(4, 1, 2, 3, 4, 5, source_path, 5.0)
+    )
+    presenter.report_generator_progress(
+        _phase_progress(
+            phase=ProgressPhase.FRAME_DECODING,
+            state=ProgressState.RUNNING,
+            completed_units=30,
+            total_units=100,
+            unit=ProgressUnit.FRAMES,
+            fraction_complete=0.3,
+            elapsed_seconds=3.0,
+            rate_per_second=10.0,
+            eta_seconds=7.0,
+            worker_count=1,
+        )
+    )
+    presenter.emit(
+        logging.LogRecord(
+            "cinebar.directory",
+            logging.INFO,
+            __file__,
+            0,
+            "Discovered source.\nSource: %s",
+            (source_path,),
+            None,
+        )
+    )
+    presenter.report_directory_progress(DirectoryProgress(4, 0, 0, 3, 4, 5, None, 5.0))
+
+    rendered = stream.getvalue()
+
+    assert (
+        "Discovered 4 | Waiting 1 | Queued 2 | Completed 3 | Skipped 4 | Failed 5"
+    ) in rendered
+    assert "Movie: Movie.mkv" in rendered
+    assert f"Path: {source_path}" in rendered
+    assert "30/100 frames" in rendered
+    assert "30%" in rendered
+    assert "elapsed 00:00:03" in rendered
+    assert "10.0 frames/s" in rendered
+    assert "ETA 00:00:07" in rendered
+    assert f"\rINFO Discovered source.\n  Source: {source_path}\n" in rendered
+    assert "Watching for new videos... Next scan in 00:00:05" in rendered
+
+
+def test_directory_presenter_prints_stats_at_start_and_after_each_run() -> None:
+    """Persist counters once before work and once after each terminal outcome."""
+    stream = StringIO()
+    presenter = DirectoryConsolePresenter(stream)
+    presenter.setFormatter(logging.Formatter("%(levelname)s %(message)s"))
+    first_source = Path("Library") / "First.mkv"
+    second_source = Path("Library") / "Second.mkv"
+
+    presenter.report_directory_progress(
+        DirectoryProgress(2, 0, 1, 0, 0, 0, first_source, None)
+    )
+    presenter.report_generator_progress(
+        _phase_progress(
+            phase=ProgressPhase.FRAME_DECODING,
+            state=ProgressState.RUNNING,
+            completed_units=1,
+            total_units=2,
+            unit=ProgressUnit.FRAMES,
+            fraction_complete=0.5,
+            worker_count=4,
+        )
+    )
+    presenter.emit(
+        logging.LogRecord(
+            "cinebar.directory",
+            logging.INFO,
+            __file__,
+            0,
+            "Processing source.",
+            (),
+            None,
+        )
+    )
+    presenter.report_directory_progress(DirectoryProgress(2, 0, 1, 1, 0, 0, None, None))
+    presenter.emit(
+        logging.LogRecord(
+            "cinebar.directory",
+            logging.INFO,
+            __file__,
+            0,
+            "Completed source.",
+            (),
+            None,
+        )
+    )
+    presenter.report_directory_progress(
+        DirectoryProgress(2, 0, 0, 1, 0, 0, second_source, None)
+    )
+    presenter.report_directory_progress(DirectoryProgress(2, 0, 0, 2, 0, 0, None, None))
+
+    persisted_lines = [
+        line.rsplit("\r", 1)[-1] for line in stream.getvalue().split("\n")
+    ]
+    stats_lines = [line for line in persisted_lines if line.startswith("Discovered ")]
+
+    assert stats_lines == [
+        "Discovered 2 | Waiting 0 | Queued 1 | Completed 0 | Skipped 0 | Failed 0",
+        "Discovered 2 | Waiting 0 | Queued 1 | Completed 1 | Skipped 0 | Failed 0",
+        "Discovered 2 | Waiting 0 | Queued 0 | Completed 2 | Skipped 0 | Failed 0",
+    ]
+
+
+def test_directory_presenter_replaces_progress_on_non_tty_stream() -> None:
+    """Redraw directory progress in place when the stream does not report a TTY."""
+    stream = StringIO()
+    presenter = DirectoryConsolePresenter(stream)
+    source_path = Path("Library") / "Movie.mkv"
+    presenter.report_directory_progress(
+        DirectoryProgress(1, 0, 0, 0, 0, 0, source_path, 5.0)
+    )
+    presenter.report_generator_progress(
+        _phase_progress(
+            phase=ProgressPhase.FRAME_DECODING,
+            state=ProgressState.STARTED,
+            completed_units=0,
+            total_units=2,
+            unit=ProgressUnit.FRAMES,
+            fraction_complete=0.0,
+            worker_count=1,
+        )
+    )
+    presenter.report_generator_progress(
+        _phase_progress(
+            phase=ProgressPhase.FRAME_DECODING,
+            state=ProgressState.COMPLETED,
+            completed_units=2,
+            total_units=2,
+            unit=ProgressUnit.FRAMES,
+            fraction_complete=1.0,
+            worker_count=1,
+        )
+    )
+    presenter.finish()
+
+    rendered = stream.getvalue()
+
+    assert rendered.startswith(
+        "Discovered 1 | Waiting 0 | Queued 0 | Completed 0 | Skipped 0 | Failed 0\n"
+    )
+    assert rendered.count("\n") == 1
+    assert rendered.count("Decoding frames [") == 2
+    assert "2/2 frames" in rendered
+    assert "\x1b" not in rendered
+
+
+def test_directory_presenter_prioritizes_multiworker_progress_on_one_row() -> None:
+    """Keep the active bar visible when directory context exceeds terminal width."""
+    stream = StringIO()
+    presenter = DirectoryConsolePresenter(stream)
+    source_path = (
+        Path("Library")
+        / "Deeply Nested Collection"
+        / "A Movie With A Very Long Descriptive Name.mkv"
+    )
+    presenter.report_directory_progress(
+        DirectoryProgress(12, 3, 8, 4, 1, 2, source_path, 5.0)
+    )
+    presenter.report_generator_progress(
+        _phase_progress(
+            phase=ProgressPhase.FRAME_DECODING,
+            state=ProgressState.RUNNING,
+            completed_units=12_345,
+            total_units=98_765,
+            unit=ProgressUnit.FRAMES,
+            fraction_complete=0.125,
+            elapsed_seconds=3_723.0,
+            rate_per_second=123.4,
+            eta_seconds=25_000.0,
+            worker_count=16,
+        )
+    )
+
+    status_line = stream.getvalue().split("\r")[-1]
+
+    assert len(status_line) <= 80
+    assert status_line.startswith("Decoding frames [")
+    assert "16 workers" in status_line
+
+
+def test_directory_presenter_omits_unreliable_percentages_and_eta() -> None:
+    """Keep unknown frame totals and ETA absent from directory status."""
+    stream = _InteractiveStream()
+    presenter = DirectoryConsolePresenter(stream)
+    source_path = Path("Library") / "Movie.mkv"
+    presenter.report_directory_progress(
+        DirectoryProgress(1, 0, 0, 0, 0, 0, source_path, 5.0)
+    )
+    presenter.report_generator_progress(
+        _phase_progress(
+            phase=ProgressPhase.FRAME_DECODING,
+            state=ProgressState.RUNNING,
+            completed_units=12,
+            total_units=None,
+            unit=ProgressUnit.FRAMES,
+            fraction_complete=None,
+            elapsed_seconds=3.0,
+            rate_per_second=4.0,
+            worker_count=2,
+        )
+    )
+    presenter.report_generator_progress(
+        ProcessingCompleted(
+            result=ProcessingResult(
+                output_path=Path("barcode.png"),
+                decoded_frame_count=12,
+                output_width=12,
+                output_height=3,
+            ),
+            elapsed_seconds=3.0,
+            average_frames_per_second=4.0,
+            worker_count=2,
+            accepted_crop=None,
+        )
+    )
+
+    rendered = stream.getvalue()
+
+    assert "12 frames" in rendered
+    assert "2 workers" in rendered
+    assert "ETA" not in rendered
+    assert "%" not in rendered
+    assert "Complete: 12 frames, 12x3, crop none, 2 workers" in rendered

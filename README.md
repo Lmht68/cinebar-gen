@@ -37,6 +37,7 @@ Batch mode recursively scans `ROOT` for case-insensitive `.avi`, `.m2ts`, `.m4v`
 It skips dot-prefixed and host-hidden entries, symlinks, and Windows reparse points.
 Each movie is generated one at a time, using the normal `--height`, `--workers`, `--crop`, and `--overwrite` options.
 Batch mode waits for each initially discovered source to keep its size and nanosecond modification time unchanged for the settling period, which defaults to 60 seconds.
+This two-observation metadata rule is a readiness heuristic and cannot prove that another writer has finished or closed the source.
 It rechecks that version immediately before and after generation, returning a changed regular source to settling while readiness time remains.
 Generation writes an unpublished same-directory artifact, so a final barcode remains absent or unchanged until atomic publication.
 Batch keeps source-version and generation-request observations only in memory for one command invocation.
@@ -68,12 +69,14 @@ uv run cinebar batch ROOT --output-dir DEST --output-layout flat
 When `DEST` is a strict descendant of `ROOT`, its entire tree is excluded from source discovery.
 
 Before destination creation or generation, Cinebar compares normalized absolute destination paths.
-If two or more sources share one destination, it records a failure for each colliding source and continues with unrelated sources.
+If two or more sources share one destination, it lists the destination and conflicting sources, records a failure for each colliding source, and continues with unrelated sources.
 `--overwrite` permits replacement of an existing output, but never permits multiple sources to share a destination.
 
 Without `--overwrite`, an existing mapped output is skipped without decoding the source or checking that its source version or generation settings match the output.
+Output existence is the only cross-run completion evidence, so it cannot prove source bytes, modification time, generation settings, crop, Cinebar version, format, or layout freshness.
 Use `--overwrite` to replace that output once for the source version during the command.
 Candidate failures, including collisions, decode errors, source changes, destination errors, and readiness timeouts, do not stop other sources from completing.
+Each failed source version receives one attempt per invocation; restart Cinebar or change the source version to attempt it again.
 Batch exits with status `0` when every candidate completes or is skipped, `2` after any candidate failure, `1` after a fatal startup or configuration failure, and `130` after interruption.
 
 ### Watch new and changed videos
@@ -91,7 +94,7 @@ Each new or changed source version must keep its size and nanosecond modificatio
 Metadata stability is a heuristic, not proof that copying has finished.
 Each source version and resolved generation request receives at most one attempt during one watch invocation.
 A size or nanosecond modification-time change starts a new settling period and makes the changed version eligible for one later attempt.
-Watch reports startup and temporary root outages, then retries at each `--scan-interval`.
+Watch reports startup and temporary root outages, then retries at each `--scan-interval` without clearing known source state.
 An unavailable scan does not treat previously observed sources as deleted.
 When the root recovers, watch reports recovery and resumes recursive discovery.
 Ctrl+C stops later scans and abandons queued movies.
@@ -99,12 +102,29 @@ It interrupts active work through normal cleanup, preserves completed barcodes, 
 The interrupted source remains eligible for a later stateless invocation.
 Watch exits `130` after interruption and emits no routine traceback.
 
+### Directory workflow presentation
+
+Directory commands report six counters for the current invocation.
+`Discovered` counts unique source versions seen during the invocation.
+`Waiting` and `Queued` are current gauges for source versions awaiting readiness and processing.
+`Completed`, `Skipped`, and `Failed` count unique terminal outcomes.
+
+Cinebar prints one counter line after the initial scan, then prints an updated counter line after each completed, skipped, or failed source.
+Between those milestones, the active redraw shows generator-native frame count, elapsed time, rate, percentage, ETA, and worker facts when they are available and fit.
+Movie and path context appear on that redraw when the terminal is wide enough.
+When watch mode has no waiting, queued, or active source, it displays `Watching for new videos...` with the next scan delay.
+Lifecycle logs cover discovery, processing starts, completed outputs, skips, collisions, failures, source changes, root outages and recovery, interruption, and shutdown.
+Lifecycle detail lines, including source and destination paths, use a two-space indent.
+Each lifecycle log clears the transient redraw instead of preserving another stats line.
+The active redraw is shortened to the detected terminal width so it cannot wrap into stale rows.
+Lifecycle logs, counter milestones, and completion summaries remain newline-terminated and contain no terminal escape sequences.
+
 
 ## Progress reporting
 
 Cinebar writes progress status to stderr by default.
-Interactive terminals redraw an in-place ASCII bar for crop analysis, frame decoding, PNG encoding, and output publication.
-Redirected stderr receives phase starts and completions plus at most one running line every 30 seconds.
+Progress updates redraw one in-place ASCII bar for crop analysis, frame decoding, PNG encoding, and output publication, even when stderr is redirected.
+The redraw stream uses carriage returns; lifecycle logs and completion summaries use newlines.
 Decode worker totals always describe the actual active worker count.
 Parallel decode totals and percentages are approximate until range and end-of-stream validation succeeds.
 Sequential decode ETA appears only when OpenCV provides finite duration metadata and monotonic in-range presentation timestamps.

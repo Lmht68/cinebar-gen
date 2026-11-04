@@ -11,6 +11,8 @@ from .errors import CinebarError, FailureCategory
 from .models import BatchFailure, BatchProcessingResult, BatchSkip, ProcessingResult
 from .processor import SingleFileProcessor
 from .progress import (
+    DirectoryProgress,
+    DirectoryProgressReporter,
     PhaseProgress,
     ProcessingCompleted,
     ProgressEvent,
@@ -30,6 +32,8 @@ __all__ = [
     "CropRectangle",
     "CropSelection",
     "DirectoryProcessor",
+    "DirectoryProgress",
+    "DirectoryProgressReporter",
     "FailureCategory",
     "GenerationSettings",
     "OutputLayout",

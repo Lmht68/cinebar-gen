@@ -10,11 +10,10 @@ from multiprocessing import freeze_support
 from pathlib import Path
 from typing import Literal, NoReturn
 
-from .console import ConsoleProgressRenderer
+from .console import ConsoleProgressRenderer, DirectoryConsolePresenter
 from .crop import CropMode, CropRectangle, CropSelection
 from .directory import DirectoryProcessor, GenerationSettings, OutputLayout
 from .errors import CinebarError, FailureCategory
-from .models import BatchFailure, BatchSkip, ProcessingResult
 from .processor import SingleFileProcessor
 
 LOGGER = logging.getLogger(__name__)
@@ -35,8 +34,16 @@ class _CinebarArgumentParser(argparse.ArgumentParser):
 def _add_generation_options(
     parser: argparse.ArgumentParser,
     height_help: str,
+    *,
+    overwrite_help: str | None = None,
 ) -> None:
-    """Add generation options shared by single-file and batch commands."""
+    """Add generation options shared by single-file and directory commands.
+
+    Args:
+        parser: Parser receiving the shared generation options.
+        height_help: Command-specific height option description.
+        overwrite_help: Optional directory-specific overwrite description.
+    """
     parser.add_argument(
         "--height",
         type=_positive_integer,
@@ -62,14 +69,18 @@ def _add_generation_options(
     parser.add_argument(
         "--overwrite",
         action="store_true",
-        help="Replace an existing final PNG after complete encoding.",
+        help=overwrite_help or "Replace an existing final PNG after complete encoding.",
     )
 
 
 def _build_single_file_parser() -> _CinebarArgumentParser:
     """Build the compatibility-sensitive legacy single-file parser."""
     parser = _CinebarArgumentParser(
-        description="Generate a complete lossless media barcode."
+        description=(
+            "Generate a complete lossless media barcode.\n\n"
+            "For recursive directory workflows, run 'cinebar batch --help' or "
+            "'cinebar watch --help'."
+        )
     )
     parser.add_argument("media_path", type=Path, help="Local media file to decode.")
     parser.add_argument("--output", required=True, type=Path, help="Final PNG path.")
@@ -89,12 +100,37 @@ def _build_directory_parser(
             "Generate barcodes from a stable media directory. Outputs default to "
             "beside-input, or mirrored paths under --output-dir."
         )
+        epilog = """Examples:
+  cinebar batch ROOT --output-beside-input
+  cinebar batch ROOT --output-dir DEST
+  cinebar batch ROOT --output-dir DEST --output-layout flat
+
+Readiness requires two unchanged size and nanosecond modification-time observations.
+Existing mapped outputs are skipped without source freshness checks.
+Collisions list conflicting sources and remain errors with --overwrite.
+Each source version receives one attempt per invocation.
+Ctrl+C abandons queued work, cleans active unpublished output, and exits 130.
+Exit codes: 0 complete or skipped, 1 fatal, 2 candidate failure, 130 Ctrl+C."""
     else:
         description = (
             "Watch recursively scans in the foreground until interrupted. Outputs "
             "default to beside-input, or mirrored paths under --output-dir."
         )
-    parser = _CinebarArgumentParser(description=description)
+        epilog = """Example:
+  cinebar watch ROOT --output-dir DEST --scan-interval 60
+
+Output placement supports beside-input, mirrored, and flat layouts.
+Settling requires two unchanged observations; --scan-interval schedules later scans.
+One source version receives one attempt per invocation.
+Temporary root outages retry without clearing known state.
+Ctrl+C abandons queued work and cleans active unpublished output.
+Exit codes: 1 fatal, 130 Ctrl+C."""
+    parser = _CinebarArgumentParser(
+        prog=f"cinebar {command}",
+        description=description,
+        epilog=epilog,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     parser.add_argument(
         "root",
         type=Path,
@@ -155,6 +191,10 @@ def _build_directory_parser(
     _add_generation_options(
         parser,
         height_help="Barcode height in pixels. Defaults to 100.",
+        overwrite_help=(
+            "Replace an existing final PNG after complete encoding. "
+            "Never resolves a source collision."
+        ),
     )
     return parser
 
@@ -178,32 +218,6 @@ def _directory_command(
     return "watch"
 
 
-def _log_directory_outcome(
-    outcome: ProcessingResult | BatchSkip | BatchFailure,
-) -> bool:
-    """Log one non-successful directory outcome and report whether it failed."""
-    if isinstance(outcome, ProcessingResult):
-        return False
-    if isinstance(outcome, BatchSkip):
-        LOGGER.info(
-            "Skipped existing mapped output without verifying source or "
-            "generation settings.\nSource: %s\nDestination: %s",
-            outcome.source_path,
-            outcome.output_path,
-        )
-        return False
-    detail = f"Source: {outcome.source_path}"
-    if outcome.safe_detail is not None:
-        detail = f"{detail}\n{outcome.safe_detail}"
-    failure_error = CinebarError(outcome.category, detail)
-    LOGGER.error(
-        "[%s] %s",
-        failure_error.category.value,
-        failure_error,
-    )
-    return True
-
-
 def main(argv: Sequence[str] | None = None) -> int:
     """Generate barcodes from one media file or a stable directory tree.
 
@@ -218,12 +232,24 @@ def main(argv: Sequence[str] | None = None) -> int:
     freeze_support()
     if hasattr(signal, "SIGBREAK"):
         signal.signal(signal.SIGBREAK, signal.default_int_handler)
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     arguments = list(sys.argv[1:] if argv is None else argv)
-    renderer: ConsoleProgressRenderer | None = None
+    directory_command = _directory_command(arguments)
+    renderer: ConsoleProgressRenderer | DirectoryConsolePresenter | None = None
+    directory_presenter: DirectoryConsolePresenter | None = None
+    if directory_command is not None:
+        directory_presenter = DirectoryConsolePresenter()
+        renderer = directory_presenter
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(levelname)s %(message)s",
+            handlers=[directory_presenter],
+        )
+    else:
+        logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+
     try:
-        directory_command = _directory_command(arguments)
         if directory_command is not None:
+            assert directory_presenter is not None
             directory_arguments = _build_directory_parser(directory_command).parse_args(
                 arguments[1:]
             )
@@ -256,31 +282,25 @@ def main(argv: Sequence[str] | None = None) -> int:
                     else 60.0
                 ),
             )
-            renderer = ConsoleProgressRenderer()
             directory_processor = DirectoryProcessor()
             if directory_command == "batch":
                 batch_result = directory_processor.process_batch(
                     root=directory_arguments.root,
                     settings=settings,
-                    progress_reporter=renderer,
+                    progress_reporter=directory_presenter.report_generator_progress,
+                    directory_progress_reporter=(
+                        directory_presenter.report_directory_progress
+                    ),
                 )
-                renderer.finish_line()
-                for skipped in batch_result.skipped:
-                    _log_directory_outcome(skipped)
-                batch_failed = False
-                for failure in batch_result.failures:
-                    batch_failed = _log_directory_outcome(failure) or batch_failed
-                if batch_failed:
-                    return 2
-            else:
-                for outcome in directory_processor.process_watch(
-                    root=directory_arguments.root,
-                    settings=settings,
-                    progress_reporter=renderer,
-                ):
-                    if not isinstance(outcome, ProcessingResult):
-                        renderer.finish_line()
-                        _log_directory_outcome(outcome)
+                directory_presenter.finish()
+                return 2 if batch_result.failures else 0
+            for _ in directory_processor.process_watch(
+                root=directory_arguments.root,
+                settings=settings,
+                progress_reporter=directory_presenter.report_generator_progress,
+                directory_progress_reporter=directory_presenter.report_directory_progress,
+            ):
+                pass
         else:
             single_file_arguments = _build_single_file_parser().parse_args(arguments)
             renderer = ConsoleProgressRenderer()
@@ -294,12 +314,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                 progress_reporter=renderer,
             )
     except CinebarError as error:
-        if renderer is not None:
+        if isinstance(renderer, DirectoryConsolePresenter):
+            renderer.finish()
+        elif renderer is not None:
             renderer.finish_line()
         LOGGER.error("[%s] %s", error.category.value, error)
         return 130 if error.category is FailureCategory.INTERRUPTED else 1
     except KeyboardInterrupt:
-        if renderer is not None:
+        if isinstance(renderer, DirectoryConsolePresenter):
+            renderer.finish()
+        elif renderer is not None:
             renderer.finish_line()
         interruption = CinebarError(FailureCategory.INTERRUPTED)
         LOGGER.error("[%s] %s", interruption.category.value, interruption)
