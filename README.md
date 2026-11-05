@@ -10,6 +10,24 @@ Python 3.12 or newer and [uv](https://docs.astral.sh/uv/) are required.
 uv sync
 ```
 
+## Build the Windows executable
+
+Build on 64-bit Windows with the repository's Python 3.12 toolchain.
+PyInstaller is not a cross-compiler, so the executable matches the build OS and architecture.
+
+```console
+uv run --group build pyinstaller --clean --noconfirm --onefile --console --name cinebar --paths src src/cinebar/__main__.py
+```
+
+The single-file output is `dist/cinebar.exe`.
+It includes Python and the application's dependencies.
+
+```powershell
+./dist/cinebar.exe movie.mp4 --output movie-barcode.png --height 100
+```
+
+This is a console executable, so progress, lifecycle logs, help output, and exit codes remain visible and scriptable.
+
 ## Generate a barcode
 
 ```console
