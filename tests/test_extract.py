@@ -389,6 +389,37 @@ def test_extract_frame_colors_validates_and_combines_worker_ranges(
     assert all(capture.released for capture in captures)
 
 
+def test_extract_frame_colors_accepts_overestimated_final_frame_count(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Preserve every decodable frame when container duration overstates the total."""
+    frames = [
+        np.full((1, 1, 3), (index + 2, index + 1, index), dtype=np.uint8)
+        for index in range(3)
+    ]
+    progress_facts: list[FrameExtractionProgress] = []
+
+    def create_capture(_: str) -> FakeVideoCapture:
+        return FakeVideoCapture(frames, reported_frame_count=4.0)
+
+    monkeypatch.setattr(cv2, "VideoCapture", create_capture)
+    monkeypatch.setattr(extract_module, "Pool", FakePool)
+    monkeypatch.setattr(extract_module, "Queue", FakeQueue)
+
+    colors = extract_frame_colors(
+        Path("movie.mkv"),
+        workers=2,
+        progress_callback=progress_facts.append,
+    )
+
+    assert colors == bytes((0, 1, 2, 1, 2, 3, 2, 3, 4))
+    assert progress_facts == [
+        FrameExtractionProgress(0, 4, 2, None, None),
+        FrameExtractionProgress(3, 4, 2, None, None),
+        FrameExtractionProgress(3, 3, 2, None, None),
+    ]
+
+
 def test_extract_frame_colors_applies_crop_to_every_worker_range(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

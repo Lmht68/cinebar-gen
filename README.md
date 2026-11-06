@@ -183,8 +183,9 @@ Each decoded frame contributes one frame strip from the selected picture region.
 
 Each frame color is OpenCV's per-channel arithmetic mean, truncated to 8-bit values and stored in RGB order.
 Parallel workers process contiguous reported frame-index ranges, and the parent writes their compact colors in range order.
-Parallel extraction validates seek positions, exact range lengths, adjacent raw-frame digests, and the final end of stream before publishing.
-Any mismatch or worker failure prevents publication of the final PNG.
+When OpenCV overestimates the total, a non-empty final worker range may end at the actual end of stream before the estimate.
+Parallel extraction validates seek positions, exact non-final range lengths, adjacent raw-frame digests, and the final end of stream before publishing.
+Any other mismatch or worker failure prevents publication of the final PNG.
 
 OpenCV frame-index seeking depends on the selected codec and backend.
 The validation detects reported position, range, boundary, and end-of-stream mismatches, but it cannot mathematically prove frame identity for every input.

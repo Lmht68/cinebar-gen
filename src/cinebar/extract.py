@@ -512,10 +512,16 @@ def extract_frame_range(
             colors = bytearray(range_length * 3)
             first_frame_digest = b""
             color_offset = 0
+            actual_frame_end = frame_range.end
+            is_final_range = frame_range.end == frame_count - 1
             for expected_index in range(frame_range.start, frame_range.end + 1):
                 success, decoded_frame = capture.read()
                 if not success:
-                    raise CinebarError(FailureCategory.DECODE_FAILED)
+                    if not is_final_range or expected_index == frame_range.start:
+                        raise CinebarError(FailureCategory.DECODE_FAILED)
+                    actual_frame_end = expected_index - 1
+                    del colors[color_offset:]
+                    break
                 bgr_frame = _validate_decoded_frame(decoded_frame)
                 _require_next_frame_position(capture, expected_index + 1)
                 if expected_index == frame_range.start:
@@ -532,22 +538,28 @@ def extract_frame_range(
                     _publish_worker_progress(worker_slot, decoded_frame_count)
 
             following_frame_digest: bytes | None = None
-            if frame_range.end + 1 < frame_count:
+            if actual_frame_end == frame_range.end:
                 success, decoded_frame = capture.read()
-                if not success:
-                    raise CinebarError(FailureCategory.DECODE_FAILED)
-                following_frame = _validate_decoded_frame(decoded_frame)
-                _require_next_frame_position(capture, frame_range.end + 2)
-                following_frame_digest = sha256(following_frame).digest()
-            else:
-                success, decoded_frame = capture.read()
-                if success:
+                if frame_range.end + 1 < frame_count:
+                    if not success:
+                        raise CinebarError(FailureCategory.DECODE_FAILED)
+                    following_frame = _validate_decoded_frame(decoded_frame)
+                    _require_next_frame_position(capture, frame_range.end + 2)
+                    following_frame_digest = sha256(following_frame).digest()
+                elif success:
                     _validate_decoded_frame(decoded_frame)
                     raise CinebarError(FailureCategory.DECODE_FAILED)
-            _publish_worker_progress(worker_slot, range_length)
 
+            actual_range = FrameRange(
+                start=frame_range.start,
+                end=actual_frame_end,
+            )
+            _publish_worker_progress(
+                worker_slot,
+                actual_range.end - actual_range.start + 1,
+            )
             return ExtractedFrameRange(
-                frame_range=frame_range,
+                frame_range=actual_range,
                 colors=bytes(colors),
                 first_frame_digest=first_frame_digest,
                 following_frame_digest=following_frame_digest,
@@ -568,10 +580,10 @@ def combine_extracted_frame_ranges(
     Args:
         extracted_ranges: Worker results in requested range order.
         expected_ranges: Contiguous ranges submitted to workers.
-        frame_count: Expected complete decoded-frame count.
+        frame_count: Reported complete decoded-frame count.
 
     Returns:
-        Three packed RGB bytes for every expected frame.
+        Three packed RGB bytes for every decoded frame.
 
     Raises:
         CinebarError: If coverage, ordering, or boundary evidence differs.
@@ -585,21 +597,30 @@ def combine_extracted_frame_ranges(
     ):
         raise CinebarError(FailureCategory.DECODE_FAILED)
 
-    compact_colors = bytearray(frame_count * 3)
-    color_offset = 0
+    ordered_colors: list[bytes] = []
     previous_result: ExtractedFrameRange | None = None
-    for expected_range, extracted_range in zip(
-        expected_ranges, extracted_ranges, strict=True
+    final_range_index = len(expected_ranges) - 1
+    for range_index, (expected_range, extracted_range) in enumerate(
+        zip(expected_ranges, extracted_ranges, strict=True)
     ):
-        if extracted_range.frame_range != expected_range:
+        actual_range = extracted_range.frame_range
+        if (
+            actual_range.start != expected_range.start
+            or actual_range.end < actual_range.start
+            or actual_range.end > expected_range.end
+            or (
+                range_index != final_range_index
+                and actual_range.end != expected_range.end
+            )
+        ):
             raise CinebarError(FailureCategory.DECODE_FAILED)
-        expected_color_bytes = (expected_range.end - expected_range.start + 1) * 3
+        expected_color_bytes = (actual_range.end - actual_range.start + 1) * 3
         if len(extracted_range.colors) != expected_color_bytes:
             raise CinebarError(FailureCategory.DECODE_FAILED)
-        if expected_range.start > 0:
+        if actual_range.start > 0:
             if previous_result is None:
                 raise CinebarError(FailureCategory.DECODE_FAILED)
-            if previous_result.frame_range.end + 1 != expected_range.start:
+            if previous_result.frame_range.end + 1 != actual_range.start:
                 raise CinebarError(FailureCategory.DECODE_FAILED)
             if (
                 previous_result.following_frame_digest
@@ -607,14 +628,12 @@ def combine_extracted_frame_ranges(
             ):
                 raise CinebarError(FailureCategory.DECODE_FAILED)
 
-        next_offset = color_offset + expected_color_bytes
-        compact_colors[color_offset:next_offset] = extracted_range.colors
-        color_offset = next_offset
+        ordered_colors.append(extracted_range.colors)
         previous_result = extracted_range
 
     if previous_result is None or previous_result.following_frame_digest is not None:
         raise CinebarError(FailureCategory.DECODE_FAILED)
-    return bytes(compact_colors)
+    return b"".join(ordered_colors)
 
 
 def _validate_decoded_frame(decoded_frame: object) -> NDArray[np.uint8]:
