@@ -99,6 +99,8 @@ class SingleFileProcessor:
             workers: Process count, or ``None`` for a safe automatic count.
             overwrite: Whether an existing final PNG may be replaced.
             crop: Automatic, disabled, or fixed picture-region crop selection.
+                Automatic selection retries once without crop when complete-pass
+                boundary validation rejects the sampled rectangle.
             progress_reporter: Optional recipient for renderer-independent facts.
 
         Returns:
@@ -149,6 +151,7 @@ class SingleFileProcessor:
 
                 def report_extraction(fact: FrameExtractionProgress) -> None:
                     nonlocal actual_worker_count, decode_phase_started
+                    assert tracker is not None
                     actual_worker_count = fact.worker_count
                     if not decode_phase_started:
                         tracker.start(
@@ -175,12 +178,30 @@ class SingleFileProcessor:
 
                 extraction_progress_callback = report_extraction
 
-            compact_colors = self._frame_color_extractor(
-                media_path,
-                workers,
-                resolved_crop,
-                progress_callback=extraction_progress_callback,
-            )
+            try:
+                compact_colors = self._frame_color_extractor(
+                    media_path,
+                    workers,
+                    resolved_crop,
+                    progress_callback=extraction_progress_callback,
+                )
+            except CinebarError as error:
+                if (
+                    crop is not CropMode.AUTO
+                    or resolved_crop is None
+                    or error.category is not FailureCategory.NON_BLACK_CROP_BOUNDARY
+                ):
+                    raise
+                resolved_crop = None
+                decode_phase_started = False
+                if progress_reporter is not None:
+                    tracker = ProgressTracker(progress_reporter, clock=self._clock)
+                compact_colors = self._frame_color_extractor(
+                    media_path,
+                    workers,
+                    resolved_crop,
+                    progress_callback=extraction_progress_callback,
+                )
             if not compact_colors:
                 raise CinebarError(FailureCategory.ZERO_FRAMES)
             if len(compact_colors) % 3 != 0:

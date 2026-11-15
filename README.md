@@ -176,11 +176,13 @@ The same non-empty rectangle must fit every decoded frame.
 For automatic and explicit crops, every applicable last excluded row or column must satisfy the same near-black criterion: at least `ceil(line_pixel_count * 0.99)` pixels have every decoded channel at or below 16 in every complete-pass frame.
 Sides that remove no pixels have no crop boundary to validate.
 Genuine black pixels inside the accepted picture region remain part of the frame-color arithmetic mean.
-Invalid crop bounds or a later crop boundary below the near-black criterion fails without publishing a final PNG or retaining a destination-side temporary PNG.
 
-After the bounded automatic probe, Cinebar runs exactly one complete worker-backed color pass.
+When an automatically selected boundary fails this validation, Cinebar discards the partial colors and retries the complete extraction once with no crop.
+The same failure from an explicit crop, or invalid crop bounds in either mode, aborts without publishing a final PNG or retaining a destination-side temporary PNG.
+
+After the bounded automatic probe, Cinebar runs one complete worker-backed color pass.
+An automatic boundary fallback can therefore require a second complete pass, which decodes every frame without crop.
 Each decoded frame contributes one frame strip from the selected picture region.
-
 Each frame color is OpenCV's per-channel arithmetic mean, truncated to 8-bit values and stored in RGB order.
 Parallel workers process contiguous reported frame-index ranges, and the parent writes their compact colors in range order.
 When OpenCV overestimates the total, a non-empty final worker range may end at the actual end of stream before the estimate.

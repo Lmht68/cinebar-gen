@@ -183,6 +183,10 @@ class _SequentialCapture:
             raise read_result
         return read_result
 
+    def get(self, _: int) -> float:
+        """Return unusable metadata for optional progress estimates."""
+        return 0.0
+
     def release(self) -> None:
         """Release the synthetic capture."""
 
@@ -270,29 +274,57 @@ def test_process_skips_sampling_for_disabled_or_explicit_crop(
     assert extractor_calls == [expected_crop]
 
 
-def test_process_rejects_later_automatic_crop_boundary_before_output(
+def test_process_retries_without_crop_after_automatic_boundary_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Abort publication when later decoded content reaches an automatic boundary."""
+    """Retry automatic extraction without crop when a later boundary is non-black."""
     media_path = tmp_path / "source.mkv"
     output_path = tmp_path / "barcode.png"
     media_path.write_bytes(b"placeholder")
     first_frame = np.zeros((4, 4, 3), dtype=np.uint8)
     later_frame = np.zeros((4, 4, 3), dtype=np.uint8)
     later_frame[3, 1] = (17, 0, 0)
-    capture = _SequentialCapture([(True, first_frame), (True, later_frame)])
-    monkeypatch.setattr(cv2, "VideoCapture", lambda _: capture)
+    read_results: list[tuple[bool, object | None] | BaseException] = [
+        (True, first_frame),
+        (True, later_frame),
+    ]
+    captures = iter(
+        [_SequentialCapture(read_results), _SequentialCapture(read_results)]
+    )
+    monkeypatch.setattr(cv2, "VideoCapture", lambda _: next(captures))
+    events: list[PhaseProgress | ProcessingCompleted] = []
 
-    with pytest.raises(CinebarError) as raised_error:
-        SingleFileProcessor(
-            automatic_crop_selector=lambda _, *, progress_callback: CropRectangle(
-                1, 1, 3, 3
-            )
-        ).process(media_path, output_path, workers=1)
+    result = SingleFileProcessor(
+        automatic_crop_selector=lambda _, *, progress_callback: CropRectangle(
+            1, 1, 3, 3
+        )
+    ).process(
+        media_path,
+        output_path,
+        height=1,
+        workers=1,
+        progress_reporter=events.append,
+    )
 
-    assert raised_error.value.category is FailureCategory.NON_BLACK_CROP_BOUNDARY
-    assert not output_path.exists()
+    with output_path.open("rb") as barcode_file:
+        width, height, rows, _ = png.Reader(file=barcode_file).read()
+        actual_rows = [list(row) for row in rows]
+
+    assert result.decoded_frame_count == 2
+    assert (width, height) == (2, 1)
+    assert actual_rows == [[0, 0, 0, 0, 0, 1]]
+    decode_starts = [
+        event
+        for event in events
+        if isinstance(event, PhaseProgress)
+        and event.phase is ProgressPhase.FRAME_DECODING
+        and event.state is ProgressState.STARTED
+    ]
+    assert len(decode_starts) == 2
+    completion = events[-1]
+    assert isinstance(completion, ProcessingCompleted)
+    assert completion.accepted_crop is None
     assert not list(tmp_path.glob(f".{output_path.name}.*.tmp"))
 
 
